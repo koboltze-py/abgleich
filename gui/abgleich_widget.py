@@ -24,12 +24,14 @@ from config import (
     QUELLE_STAERKEMELDUNG,
 )
 from gui.styles import table_style, button_primary, button_secondary, card_style
+from gui.widgets import ZeitBereichEditor
 from gui.monatsuebersicht import MONATSNAMEN, WOCHENTAGE_KURZ
+from gui.dienstplan_ansicht import DienstplanAnsichtWidget
 from functions.abgleich_service import (
     berechne_abgleich, set_eintrag_status, set_status_fuer_mitarbeiter,
     get_letzte_position, set_letzte_position, get_verfuegbare_monate,
     get_manuelle_zuordnungen, manuell_zusammenfuehren, manuelle_zuordnung_aufheben,
-    manuell_trennen, monatsplan_fuer_mitarbeiter, setze_manuellen_dienst, zeit_bereich_parsen,
+    manuell_trennen, monatsplan_fuer_mitarbeiter, setze_manuellen_dienst,
     voller_monatsplan,
     ART_HINZUGEFUEGT, ART_ZEIT_GEAENDERT, ART_ENTFALLEN, ART_UNVERAENDERT, ART_KEINE_DATEN,
     STATUS_OFFEN, STATUS_ERLEDIGT,
@@ -55,6 +57,11 @@ def _hex_zu_rgba(hex_farbe: str, alpha: int) -> QColor:
     c = QColor(hex_farbe)
     c.setAlpha(alpha)
     return c
+
+
+def _hex_zu_css_rgba(hex_farbe: str, alpha: int) -> str:
+    c = QColor(hex_farbe)
+    return f"rgba({c.red()}, {c.green()}, {c.blue()}, {alpha})"
 
 
 class AbgleichWidget(QWidget):
@@ -185,9 +192,9 @@ class AbgleichWidget(QWidget):
         rechts_layout.addWidget(self._warnung_label)
 
         hinweis = QLabel(
-            "Zeigt den vollen Monat, auch Tage ohne jede Meldung. Die Spalte \"Tatsächlich\" kann "
-            "per Doppelklick von Hand nachgetragen oder korrigiert werden (Format \"07:00-15:00\", "
-            "leer lassen zum Löschen)."
+            "Zeigt den vollen Monat, auch Tage ohne jede Meldung. In der Spalte \"Tatsächlich\" kann "
+            "über die Kontrollbox eine Zeit aktiviert und per Uhrzeit-Auswahl eingetragen oder "
+            "korrigiert werden (Kontrollbox abwählen zum Löschen)."
         )
         hinweis.setWordWrap(True)
         hinweis.setStyleSheet(f"color: {FIORI_TEXT}; border: none;")
@@ -221,8 +228,18 @@ class AbgleichWidget(QWidget):
         rechts_layout.addLayout(aktion_zeile)
 
         splitter.addWidget(rechts)
+
+        # --- ganz rechts: Tagesdienstplan-Ansicht (nur zur Kontrolle, kein Export) ---
+        dienstplan_rahmen = QFrame()
+        dienstplan_rahmen.setStyleSheet(card_style())
+        dienstplan_rahmen_layout = QVBoxLayout(dienstplan_rahmen)
+        dienstplan_rahmen_layout.setContentsMargins(10, 10, 10, 10)
+        dienstplan_rahmen_layout.addWidget(DienstplanAnsichtWidget())
+        splitter.addWidget(dienstplan_rahmen)
+
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(2, 2)
         return tab
 
     def _kalender_tab_erstellen(self) -> QWidget:
@@ -386,7 +403,6 @@ class AbgleichWidget(QWidget):
         for zeile, tag in enumerate(plan):
             wochentag = WOCHENTAGE_KURZ[date.fromisoformat(tag.datum).weekday()]
             ursprung = f"{tag.ursprung_start} – {tag.ursprung_end}" if tag.ursprung_start else "–"
-            tatsaechlich = f"{tag.tatsaechlich_start} – {tag.tatsaechlich_end}" if tag.tatsaechlich_start else ""
 
             werte = [tag.datum, wochentag, ART_LABEL[tag.art], ursprung]
             for spalte, wert in enumerate(werte):
@@ -397,12 +413,15 @@ class AbgleichWidget(QWidget):
                     item.setBackground(_hex_zu_rgba(farbe, 30))
                 self._tabelle.setItem(zeile, spalte, item)
 
-            tatsaechlich_item = QTableWidgetItem(tatsaechlich)
-            tatsaechlich_item.setData(Qt.ItemDataRole.UserRole, tag.datum)
+            editor = ZeitBereichEditor(
+                tag.tatsaechlich_start, tag.tatsaechlich_end,
+                lambda zeit, datum=tag.datum: self._tatsaechlich_zeit_geaendert(datum, zeit),
+            )
             farbe = ART_FARBE.get(tag.art)
             if farbe:
-                tatsaechlich_item.setBackground(_hex_zu_rgba(farbe, 30))
-            self._tabelle.setItem(zeile, 4, tatsaechlich_item)
+                css = _hex_zu_css_rgba(farbe, 60)
+                editor.setStyleSheet(f"background-color: {css};")
+            self._tabelle.setCellWidget(zeile, 4, editor)
 
             status_item = QTableWidgetItem()
             if tag.art in _DIFF_ARTEN:
@@ -426,8 +445,6 @@ class AbgleichWidget(QWidget):
             return
         if item.column() == 5:
             self._status_geaendert(item)
-        elif item.column() == 4:
-            self._tatsaechlich_geaendert(item)
 
     def _status_geaendert(self, item: QTableWidgetItem):
         daten = item.data(Qt.ItemDataRole.UserRole)
@@ -439,13 +456,8 @@ class AbgleichWidget(QWidget):
         self._eintrag_status_aktualisieren(datum, art, status)
         self._mitarbeiter_liste_aktualisieren()
 
-    def _tatsaechlich_geaendert(self, item: QTableWidgetItem):
-        datum = item.data(Qt.ItemDataRole.UserRole)
-        try:
-            zeit = zeit_bereich_parsen(item.text())
-        except ValueError as exc:
-            QMessageBox.warning(self, "Ungültige Eingabe", str(exc))
-            self._daten_laden()
+    def _tatsaechlich_zeit_geaendert(self, datum: str, zeit: tuple[str, str] | None):
+        if self._aktueller_mitarbeiter_id is None:
             return
         setze_manuellen_dienst(self._aktueller_mitarbeiter_id, datum, zeit)
         self.aktualisieren()
