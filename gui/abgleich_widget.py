@@ -1,28 +1,38 @@
 """
 Abgleich-Workflow: vergleicht Ursprungsplanung und Tagesdienstpläne je
 Mitarbeiter und ermöglicht das geordnete Abarbeiten der gefundenen
-Abweichungen (neue Dienste, geänderte Zeiten, entfallene Dienste).
+Abweichungen (neue Dienste, geänderte Zeiten, entfallene Dienste). Zeigt
+außerdem den vollen Monat je Mitarbeiter editierbar an sowie einen
+Kalender-Tab mit dem daraus resultierenden, exportierbaren Monatsplan.
 """
+import calendar
 import os
 from datetime import date
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem, QFrame,
-    QAbstractItemView, QSplitter, QMessageBox, QInputDialog,
+    QAbstractItemView, QSplitter, QMessageBox, QInputDialog, QTabWidget,
+    QFileDialog,
 )
 from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtGui import QColor, QDesktopServices, QTextDocument
+from PySide6.QtPrintSupport import QPrinter
 
-from config import FIORI_TEXT, FIORI_SUCCESS, FIORI_WARNING, FIORI_ERROR, FIORI_BORDER, QUELLE_STAERKEMELDUNG
+from config import (
+    FIORI_TEXT, FIORI_SUCCESS, FIORI_WARNING, FIORI_ERROR, FIORI_BORDER,
+    QUELLE_STAERKEMELDUNG,
+)
 from gui.styles import table_style, button_primary, button_secondary, card_style
 from gui.monatsuebersicht import MONATSNAMEN, WOCHENTAGE_KURZ
 from functions.abgleich_service import (
     berechne_abgleich, set_eintrag_status, set_status_fuer_mitarbeiter,
     get_letzte_position, set_letzte_position, get_verfuegbare_monate,
     get_manuelle_zuordnungen, manuell_zusammenfuehren, manuelle_zuordnung_aufheben,
-    manuell_trennen,
-    ART_HINZUGEFUEGT, ART_ZEIT_GEAENDERT, ART_ENTFALLEN, STATUS_OFFEN, STATUS_ERLEDIGT,
+    manuell_trennen, monatsplan_fuer_mitarbeiter, setze_manuellen_dienst, zeit_bereich_parsen,
+    voller_monatsplan,
+    ART_HINZUGEFUEGT, ART_ZEIT_GEAENDERT, ART_ENTFALLEN, ART_UNVERAENDERT, ART_KEINE_DATEN,
+    STATUS_OFFEN, STATUS_ERLEDIGT,
 )
 from functions.dienste_service import get_dokumente
 
@@ -30,12 +40,15 @@ ART_LABEL = {
     ART_HINZUGEFUEGT: "Hinzugekommen",
     ART_ZEIT_GEAENDERT: "Zeit geändert",
     ART_ENTFALLEN: "Entfallen",
+    ART_UNVERAENDERT: "Unverändert",
+    ART_KEINE_DATEN: "–",
 }
 ART_FARBE = {
     ART_HINZUGEFUEGT: FIORI_SUCCESS,
     ART_ZEIT_GEAENDERT: FIORI_WARNING,
     ART_ENTFALLEN: FIORI_ERROR,
 }
+_DIFF_ARTEN = {ART_HINZUGEFUEGT, ART_ZEIT_GEAENDERT, ART_ENTFALLEN}
 
 
 def _hex_zu_rgba(hex_farbe: str, alpha: int) -> QColor:
@@ -49,6 +62,9 @@ class AbgleichWidget(QWidget):
         super().__init__(parent)
         self._ergebnis = None
         self._aktueller_mitarbeiter_id: int | None = None
+        self._kalender_plan: list = []
+        self._kalender_jahr: int | None = None
+        self._kalender_monat: int | None = None
         self._aufbauen()
         self.aktualisieren()
 
@@ -65,7 +81,8 @@ class AbgleichWidget(QWidget):
         hinweis = QLabel(
             "Zeigt je Mitarbeiter, welche Dienste gegenüber der Ursprungsplanung hinzugekommen, "
             "zeitlich verändert oder entfallen sind. Bearbeitete Änderungen können hier als "
-            "erledigt markiert werden, sobald sie in die externe Liste übertragen wurden."
+            "erledigt markiert werden, sobald sie in die externe Liste übertragen wurden. Im Tab "
+            "\"Kalender\" steht der daraus resultierende Monatsplan, exportierbar als Excel oder PDF."
         )
         hinweis.setWordWrap(True)
         hinweis.setStyleSheet(f"color: {FIORI_TEXT};")
@@ -93,8 +110,18 @@ class AbgleichWidget(QWidget):
         filter_zeile.addWidget(self._status_label)
         layout.addLayout(filter_zeile)
 
+        self._haupt_tabs = QTabWidget()
+        layout.addWidget(self._haupt_tabs, stretch=1)
+        self._haupt_tabs.addTab(self._bearbeitung_tab_erstellen(), "Abgleich bearbeiten")
+        self._haupt_tabs.addTab(self._kalender_tab_erstellen(), "Kalender")
+
+    def _bearbeitung_tab_erstellen(self) -> QWidget:
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        layout.addWidget(splitter, stretch=1)
+        tab_layout.addWidget(splitter, stretch=1)
 
         # --- linke Seite: Mitarbeiterliste mit Fortschritt ---
         links = QFrame()
@@ -135,7 +162,7 @@ class AbgleichWidget(QWidget):
         links_layout.addLayout(trenn_zeile)
         splitter.addWidget(links)
 
-        # --- rechte Seite: Änderungen des gewählten Mitarbeiters ---
+        # --- rechte Seite: voller Monat des gewählten Mitarbeiters (editierbar) ---
         rechts = QFrame()
         rechts.setStyleSheet(card_style())
         rechts_layout = QVBoxLayout(rechts)
@@ -157,16 +184,27 @@ class AbgleichWidget(QWidget):
         self._warnung_label.setVisible(False)
         rechts_layout.addWidget(self._warnung_label)
 
+        hinweis = QLabel(
+            "Zeigt den vollen Monat, auch Tage ohne jede Meldung. Die Spalte \"Tatsächlich\" kann "
+            "per Doppelklick von Hand nachgetragen oder korrigiert werden (Format \"07:00-15:00\", "
+            "leer lassen zum Löschen)."
+        )
+        hinweis.setWordWrap(True)
+        hinweis.setStyleSheet(f"color: {FIORI_TEXT}; border: none;")
+        rechts_layout.addWidget(hinweis)
+
         self._tabelle = QTableWidget(0, 6)
         self._tabelle.setHorizontalHeaderLabels(
             ["Datum", "Wochentag", "Art", "Ursprünglich", "Tatsächlich", "Erledigt"]
         )
         self._tabelle.setStyleSheet(table_style())
-        self._tabelle.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._tabelle.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
         self._tabelle.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._tabelle.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._tabelle.horizontalHeader().setStretchLastSection(False)
-        self._tabelle.itemChanged.connect(self._status_geaendert)
+        self._tabelle.itemChanged.connect(self._zelle_geaendert)
         rechts_layout.addWidget(self._tabelle, stretch=1)
 
         aktion_zeile = QHBoxLayout()
@@ -185,6 +223,42 @@ class AbgleichWidget(QWidget):
         splitter.addWidget(rechts)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
+        return tab
+
+    def _kalender_tab_erstellen(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+
+        hinweis = QLabel(
+            "Finaler Monatsplan aus dem Abgleich: tatsächliche Zeiten (inkl. von Hand nachgetragener "
+            "Werte in \"Abgleich bearbeiten\"), sonst die Ursprungsplanung, wo nichts anderes bekannt ist."
+        )
+        hinweis.setWordWrap(True)
+        hinweis.setStyleSheet(f"color: {FIORI_TEXT};")
+        layout.addWidget(hinweis)
+
+        self._kalender_tabelle = QTableWidget()
+        self._kalender_tabelle.setStyleSheet(table_style())
+        self._kalender_tabelle.setAlternatingRowColors(True)
+        self._kalender_tabelle.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._kalender_tabelle.verticalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self._kalender_tabelle, stretch=1)
+
+        export_zeile = QHBoxLayout()
+        btn_excel = QPushButton("Als Excel exportieren…")
+        btn_excel.setStyleSheet(button_secondary())
+        btn_excel.clicked.connect(self._als_excel_exportieren)
+        export_zeile.addWidget(btn_excel)
+        btn_pdf = QPushButton("Als PDF exportieren…")
+        btn_pdf.setStyleSheet(button_secondary())
+        btn_pdf.clicked.connect(self._als_pdf_exportieren)
+        export_zeile.addWidget(btn_pdf)
+        export_zeile.addStretch()
+        layout.addLayout(export_zeile)
+
+        return tab
 
     # ------------------------------------------------------------------
     def _monate_laden(self):
@@ -216,6 +290,9 @@ class AbgleichWidget(QWidget):
             self._mitarbeiter_liste.clear()
             self._tabelle.setRowCount(0)
             self._dokument_combo.clear()
+            self._kalender_plan = []
+            self._kalender_tabelle.setRowCount(0)
+            self._kalender_tabelle.setColumnCount(0)
             self._mitarbeiter_titel.setText("Kein Monat mit Ursprungsplanung UND Tagesdienstplänen vorhanden.")
             self._status_label.setText("")
             return
@@ -223,6 +300,7 @@ class AbgleichWidget(QWidget):
         jahr, monat = auswahl
         self._ergebnis = berechne_abgleich(jahr, monat)
         self._dokumente_laden(jahr, monat)
+        self._kalender_befuellen(jahr, monat)
 
         self._mitarbeiter_liste.blockSignals(True)
         self._mitarbeiter_liste.clear()
@@ -301,43 +379,76 @@ class AbgleichWidget(QWidget):
             set_letzte_position(self._ergebnis.jahr, self._ergebnis.monat, mid)
 
     def _tabelle_befuellen(self, ma):
+        jahr, monat = self._ergebnis.jahr, self._ergebnis.monat
+        plan = monatsplan_fuer_mitarbeiter(jahr, monat, ma.mitarbeiter_ids)
         self._tabelle.blockSignals(True)
-        self._tabelle.setRowCount(len(ma.eintraege))
-        for zeile, eintrag in enumerate(ma.eintraege):
-            wochentag = WOCHENTAGE_KURZ[date.fromisoformat(eintrag.datum).weekday()]
-            alt = f"{eintrag.alt_start} – {eintrag.alt_end}" if eintrag.alt_start else "–"
-            neu = f"{eintrag.neu_start} – {eintrag.neu_end}" if eintrag.neu_start else "–"
+        self._tabelle.setRowCount(len(plan))
+        for zeile, tag in enumerate(plan):
+            wochentag = WOCHENTAGE_KURZ[date.fromisoformat(tag.datum).weekday()]
+            ursprung = f"{tag.ursprung_start} – {tag.ursprung_end}" if tag.ursprung_start else "–"
+            tatsaechlich = f"{tag.tatsaechlich_start} – {tag.tatsaechlich_end}" if tag.tatsaechlich_start else ""
 
-            werte = [eintrag.datum, wochentag, ART_LABEL[eintrag.art], alt, neu]
+            werte = [tag.datum, wochentag, ART_LABEL[tag.art], ursprung]
             for spalte, wert in enumerate(werte):
                 item = QTableWidgetItem(wert)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                farbe = ART_FARBE[eintrag.art]
-                item.setBackground(_hex_zu_rgba(farbe, 30))
+                farbe = ART_FARBE.get(tag.art)
+                if farbe:
+                    item.setBackground(_hex_zu_rgba(farbe, 30))
                 self._tabelle.setItem(zeile, spalte, item)
 
+            tatsaechlich_item = QTableWidgetItem(tatsaechlich)
+            tatsaechlich_item.setData(Qt.ItemDataRole.UserRole, tag.datum)
+            farbe = ART_FARBE.get(tag.art)
+            if farbe:
+                tatsaechlich_item.setBackground(_hex_zu_rgba(farbe, 30))
+            self._tabelle.setItem(zeile, 4, tatsaechlich_item)
+
             status_item = QTableWidgetItem()
-            status_item.setFlags(
-                (item.flags() | Qt.ItemFlag.ItemIsUserCheckable) & ~Qt.ItemFlag.ItemIsEditable
-            )
-            status_item.setCheckState(
-                Qt.CheckState.Checked if eintrag.status == STATUS_ERLEDIGT else Qt.CheckState.Unchecked
-            )
-            status_item.setData(Qt.ItemDataRole.UserRole, (eintrag.datum, eintrag.art))
+            if tag.art in _DIFF_ARTEN:
+                status_item.setFlags(
+                    (status_item.flags() | Qt.ItemFlag.ItemIsUserCheckable) & ~Qt.ItemFlag.ItemIsEditable
+                )
+                status_item.setCheckState(
+                    Qt.CheckState.Checked if tag.status == STATUS_ERLEDIGT else Qt.CheckState.Unchecked
+                )
+                status_item.setData(Qt.ItemDataRole.UserRole, (tag.datum, tag.art))
+            else:
+                status_item.setFlags(Qt.ItemFlag.NoItemFlags)
             self._tabelle.setItem(zeile, 5, status_item)
 
         self._tabelle.resizeColumnsToContents()
         self._tabelle.blockSignals(False)
 
     # ------------------------------------------------------------------
-    def _status_geaendert(self, item: QTableWidgetItem):
-        if item.column() != 5 or self._aktueller_mitarbeiter_id is None:
+    def _zelle_geaendert(self, item: QTableWidgetItem):
+        if self._aktueller_mitarbeiter_id is None:
             return
-        datum, art = item.data(Qt.ItemDataRole.UserRole)
+        if item.column() == 5:
+            self._status_geaendert(item)
+        elif item.column() == 4:
+            self._tatsaechlich_geaendert(item)
+
+    def _status_geaendert(self, item: QTableWidgetItem):
+        daten = item.data(Qt.ItemDataRole.UserRole)
+        if not daten:
+            return
+        datum, art = daten
         status = STATUS_ERLEDIGT if item.checkState() == Qt.CheckState.Checked else STATUS_OFFEN
         set_eintrag_status(self._aktueller_mitarbeiter_id, datum, art, status)
         self._eintrag_status_aktualisieren(datum, art, status)
         self._mitarbeiter_liste_aktualisieren()
+
+    def _tatsaechlich_geaendert(self, item: QTableWidgetItem):
+        datum = item.data(Qt.ItemDataRole.UserRole)
+        try:
+            zeit = zeit_bereich_parsen(item.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Ungültige Eingabe", str(exc))
+            self._daten_laden()
+            return
+        setze_manuellen_dienst(self._aktueller_mitarbeiter_id, datum, zeit)
+        self.aktualisieren()
 
     def _eintrag_status_aktualisieren(self, datum: str, art: str, status: str):
         if not self._ergebnis or self._aktueller_mitarbeiter_id is None:
@@ -371,8 +482,15 @@ class AbgleichWidget(QWidget):
             return
 
         if nur_auswahl:
+            # Tabelle zeigt jetzt den vollen Monat - über (Datum, Art) der
+            # markierten Zeilen (Spalte "Erledigt") die passenden Einträge finden
             zeilen = sorted({i.row() for i in self._tabelle.selectedIndexes()})
-            eintraege = [ma.eintraege[z] for z in zeilen]
+            schluessel = set()
+            for z in zeilen:
+                daten = self._tabelle.item(z, 5).data(Qt.ItemDataRole.UserRole)
+                if daten:
+                    schluessel.add(daten)
+            eintraege = [e for e in ma.eintraege if (e.datum, e.art) in schluessel]
         else:
             eintraege = ma.eintraege
 
@@ -483,3 +601,135 @@ class AbgleichWidget(QWidget):
             QMessageBox.warning(self, "Datei nicht gefunden", f"Die Datei wurde nicht gefunden:\n{pfad}")
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(pfad))
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _finale_zeit(tag) -> tuple[str, str] | None:
+        if tag.tatsaechlich_start:
+            return tag.tatsaechlich_start, tag.tatsaechlich_end
+        if tag.ursprung_start:
+            return tag.ursprung_start, tag.ursprung_end
+        return None
+
+    def _kalender_befuellen(self, jahr: int, monat: int):
+        self._kalender_jahr, self._kalender_monat = jahr, monat
+        self._kalender_plan = voller_monatsplan(jahr, monat)
+
+        anzahl_tage = calendar.monthrange(jahr, monat)[1]
+        tabelle = self._kalender_tabelle
+        tabelle.clear()
+        tabelle.setRowCount(len(self._kalender_plan))
+        tabelle.setColumnCount(anzahl_tage)
+        tabelle.setVerticalHeaderLabels([m.name for m in self._kalender_plan])
+
+        header_labels = []
+        for tag in range(1, anzahl_tage + 1):
+            wochentag = WOCHENTAGE_KURZ[date(jahr, monat, tag).weekday()]
+            header_labels.append(f"{tag:02d}\n{wochentag}")
+        tabelle.setHorizontalHeaderLabels(header_labels)
+
+        for zeile, mitarbeiter in enumerate(self._kalender_plan):
+            for spalte, tag in enumerate(mitarbeiter.tage):
+                zeit = self._finale_zeit(tag)
+                if not zeit:
+                    continue
+                item = QTableWidgetItem(f"{zeit[0]}-{zeit[1]}")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                farbe = ART_FARBE.get(tag.art)
+                if farbe:
+                    item.setBackground(_hex_zu_rgba(farbe, 35))
+                tabelle.setItem(zeile, spalte, item)
+
+        tabelle.resizeColumnsToContents()
+        tabelle.horizontalHeader().setMinimumSectionSize(58)
+
+    def _als_excel_exportieren(self):
+        if not self._kalender_plan:
+            QMessageBox.information(self, "Export", "Kein Monatsplan zum Exportieren vorhanden.")
+            return
+        vorschlag = f"Monatsplan_{self._kalender_jahr:04d}-{self._kalender_monat:02d}.xlsx"
+        pfad, _ = QFileDialog.getSaveFileName(self, "Monatsplan als Excel speichern", vorschlag, "Excel-Dateien (*.xlsx)")
+        if not pfad:
+            return
+        try:
+            self._excel_schreiben(pfad)
+        except Exception as exc:
+            QMessageBox.warning(self, "Export fehlgeschlagen", str(exc))
+            return
+        QMessageBox.information(self, "Export erfolgreich", f"Monatsplan gespeichert:\n{pfad}")
+
+    def _excel_schreiben(self, pfad: str):
+        from openpyxl import Workbook
+
+        jahr, monat = self._kalender_jahr, self._kalender_monat
+        anzahl_tage = calendar.monthrange(jahr, monat)[1]
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Monatsplan"
+        ws.cell(row=1, column=1, value="Mitarbeiter")
+        for tag in range(1, anzahl_tage + 1):
+            wochentag = WOCHENTAGE_KURZ[date(jahr, monat, tag).weekday()]
+            ws.cell(row=1, column=tag + 1, value=f"{tag:02d}.{wochentag}")
+
+        for zeile, mitarbeiter in enumerate(self._kalender_plan, start=2):
+            ws.cell(row=zeile, column=1, value=mitarbeiter.name)
+            for spalte, tag in enumerate(mitarbeiter.tage, start=2):
+                zeit = self._finale_zeit(tag)
+                if zeit:
+                    ws.cell(row=zeile, column=spalte, value=f"{zeit[0]}-{zeit[1]}")
+
+        ws.freeze_panes = "B2"
+        ws.column_dimensions["A"].width = 22
+        wb.save(pfad)
+
+    def _als_pdf_exportieren(self):
+        if not self._kalender_plan:
+            QMessageBox.information(self, "Export", "Kein Monatsplan zum Exportieren vorhanden.")
+            return
+        vorschlag = f"Monatsplan_{self._kalender_jahr:04d}-{self._kalender_monat:02d}.pdf"
+        pfad, _ = QFileDialog.getSaveFileName(self, "Monatsplan als PDF speichern", vorschlag, "PDF-Dateien (*.pdf)")
+        if not pfad:
+            return
+        try:
+            self._pdf_schreiben(pfad)
+        except Exception as exc:
+            QMessageBox.warning(self, "Export fehlgeschlagen", str(exc))
+            return
+        QMessageBox.information(self, "Export erfolgreich", f"Monatsplan gespeichert:\n{pfad}")
+
+    def _pdf_schreiben(self, pfad: str):
+        jahr, monat = self._kalender_jahr, self._kalender_monat
+        anzahl_tage = calendar.monthrange(jahr, monat)[1]
+
+        kopf = "<tr><th>Mitarbeiter</th>" + "".join(
+            f"<th>{tag:02d}<br/>{WOCHENTAGE_KURZ[date(jahr, monat, tag).weekday()]}</th>"
+            for tag in range(1, anzahl_tage + 1)
+        ) + "</tr>"
+        zeilen_html = []
+        for mitarbeiter in self._kalender_plan:
+            zellen = [f"<td>{mitarbeiter.name}</td>"]
+            for tag in mitarbeiter.tage:
+                zeit = self._finale_zeit(tag)
+                zellen.append(f"<td>{zeit[0]}-{zeit[1]}</td>" if zeit else "<td></td>")
+            zeilen_html.append("<tr>" + "".join(zellen) + "</tr>")
+
+        html = (
+            "<html><body>"
+            f"<h3>Monatsplan {MONATSNAMEN[monat - 1]} {jahr}</h3>"
+            "<table border='1' cellspacing='0' cellpadding='3' style='font-size:7pt; border-collapse:collapse;'>"
+            f"{kopf}{''.join(zeilen_html)}"
+            "</table></body></html>"
+        )
+
+        dokument = QTextDocument()
+        dokument.setHtml(html)
+
+        drucker = QPrinter(QPrinter.PrinterMode.HighResolution)
+        drucker.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+        drucker.setOutputFileName(pfad)
+        layout = drucker.pageLayout()
+        layout.setOrientation(layout.Orientation.Landscape)
+        drucker.setPageLayout(layout)
+        dokument.print_(drucker)
+

@@ -4,8 +4,10 @@ geleisteten Tagesdienstplänen (Stärkemeldung) je Mitarbeiter und Tag und
 verwaltet den Bearbeitungs-Workflow (offen/erledigt je Änderung, zuletzt
 bearbeiteter Mitarbeiter je Monat).
 """
+import calendar
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from itertools import permutations
 
 from config import QUELLE_STAERKEMELDUNG, QUELLE_URSPRUNGSPLANUNG
@@ -14,9 +16,14 @@ from database.db import get_connection, jetzt
 ART_HINZUGEFUEGT = "hinzugefuegt"
 ART_ZEIT_GEAENDERT = "zeit_geaendert"
 ART_ENTFALLEN = "entfallen"
+ART_UNVERAENDERT = "unveraendert"
+ART_KEINE_DATEN = "keine_daten"
 
 STATUS_OFFEN = "offen"
 STATUS_ERLEDIGT = "erledigt"
+
+_MANUELLER_DOKUMENT_PFAD = "__manuelle_eingabe_abgleich__"
+_ZEIT_BEREICH_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$")
 
 _INITIALE_RE = re.compile(r"^[A-ZÄÖÜ]\.?$")
 
@@ -237,16 +244,146 @@ def _monatsgrenzen(jahr: int, monat: int) -> tuple[str, str]:
     return von, bis
 
 
-def berechne_abgleich(jahr: int, monat: int) -> AbgleichErgebnis:
-    """Vergleicht je Mitarbeiter und Tag die Ursprungsplanung mit den
-    Tagesdienstplänen. Mitarbeiter werden dabei anhand ihrer Namensbestandteile
-    zusammengeführt, auch wenn Ursprungsplanung und Tagesdienstpläne den Namen
-    unterschiedlich geschrieben oder unterschiedlich stark abgekürzt haben
-    (z. B. "Adrovic A." vs. "Adrian Adrovic" vs. nur "Adrovic", oder
-    "Bakkal Em" vs. "Emirhan Bakkal"). Mehrdeutige Namen (z. B. nur "Tunahan",
-    wenn es zwei unterschiedliche Personen mit Vorname Tunahan gibt) werden
-    NICHT geraten, sondern bleiben als eigener Mismatch stehen. Mitarbeiter
-    ohne Abweichungen werden nicht aufgeführt."""
+@dataclass
+class TagesZeile:
+    """Ein einzelner Tag im vollen Monats-Editor eines Mitarbeiters (auch Tage
+    ohne jede Abweichung oder ganz ohne Daten in einer der beiden Quellen)."""
+    datum: str
+    ursprung_start: str | None = None
+    ursprung_end: str | None = None
+    tatsaechlich_start: str | None = None
+    tatsaechlich_end: str | None = None
+    art: str = ART_KEINE_DATEN
+    status: str = STATUS_OFFEN
+
+
+def zeit_bereich_parsen(text: str) -> tuple[str, str] | None:
+    """Parst eine von Hand eingegebene Zeit wie "07:00-15:00". Gibt None bei
+    leerem Text zurück, wirft ValueError bei ungültigem Format."""
+    text = text.strip()
+    if not text:
+        return None
+    treffer = _ZEIT_BEREICH_RE.match(text)
+    if not treffer:
+        raise ValueError(f"Ungültiges Format: {text!r} (erwartet z. B. \"07:00-15:00\")")
+    sh, sm, eh, em = (int(t) for t in treffer.groups())
+    if sh > 23 or eh > 23 or sm > 59 or em > 59:
+        raise ValueError(f"Ungültige Uhrzeit: {text!r}")
+    return f"{sh:02d}:{sm:02d}", f"{eh:02d}:{em:02d}"
+
+
+def monatsplan_fuer_mitarbeiter(jahr: int, monat: int, mitarbeiter_ids: list[int]) -> list[TagesZeile]:
+    """Liefert für einen Mitarbeiter (bzw. alle zusammengeführten mitarbeiter_id
+    einer Identität) JEDEN Tag des Monats - auch Tage ganz ohne Daten in einer
+    der beiden Quellen, damit sie direkt von Hand nachgetragen werden können."""
+    if not mitarbeiter_ids:
+        return []
+    von, bis = _monatsgrenzen(jahr, monat)
+    platzhalter = ",".join("?" * len(mitarbeiter_ids))
+    con = get_connection()
+    try:
+        rows = con.execute(
+            f"""
+            SELECT quelle, datum, start_zeit, end_zeit FROM dienste
+            WHERE mitarbeiter_id IN ({platzhalter}) AND datum >= ? AND datum < ?
+            ORDER BY start_zeit
+            """,
+            (*mitarbeiter_ids, von, bis),
+        ).fetchall()
+        status_rows = con.execute(
+            f"SELECT datum, art, status FROM abgleich_status WHERE mitarbeiter_id IN ({platzhalter})",
+            mitarbeiter_ids,
+        ).fetchall()
+    finally:
+        con.close()
+
+    up_tage: dict[str, tuple[str, str]] = {}
+    sm_tage: dict[str, tuple[str, str]] = {}
+    for r in rows:
+        ziel = up_tage if r["quelle"] == QUELLE_URSPRUNGSPLANUNG else sm_tage
+        ziel.setdefault(r["datum"], (r["start_zeit"], r["end_zeit"]))
+
+    status_lookup = {(r["datum"], r["art"]): r["status"] for r in status_rows}
+
+    anzahl_tage = calendar.monthrange(jahr, monat)[1]
+    ergebnis: list[TagesZeile] = []
+    for tag in range(1, anzahl_tage + 1):
+        datum = f"{jahr:04d}-{monat:02d}-{tag:02d}"
+        up = up_tage.get(datum)
+        sm = sm_tage.get(datum)
+
+        if up is None and sm is None:
+            art = ART_KEINE_DATEN
+        elif up == sm:
+            art = ART_UNVERAENDERT
+        elif up is None:
+            art = ART_HINZUGEFUEGT
+        elif sm is None:
+            art = ART_ENTFALLEN
+        else:
+            art = ART_ZEIT_GEAENDERT
+
+        ergebnis.append(TagesZeile(
+            datum=datum,
+            ursprung_start=up[0] if up else None, ursprung_end=up[1] if up else None,
+            tatsaechlich_start=sm[0] if sm else None, tatsaechlich_end=sm[1] if sm else None,
+            art=art, status=status_lookup.get((datum, art), STATUS_OFFEN),
+        ))
+    return ergebnis
+
+
+def _manueller_dokument_id(con) -> int:
+    row = con.execute("SELECT id FROM dokumente WHERE dateipfad = ?", (_MANUELLER_DOKUMENT_PFAD,)).fetchone()
+    if row:
+        return row["id"]
+    cur = con.execute(
+        "INSERT INTO dokumente (dateipfad, dateiname, quelle, von_datum, bis_datum, importiert_am, anzahl_eintraege) "
+        "VALUES (?, ?, ?, NULL, NULL, ?, 0)",
+        (_MANUELLER_DOKUMENT_PFAD, "Manuelle Eingabe (Abgleich)", QUELLE_STAERKEMELDUNG, jetzt()),
+    )
+    return cur.lastrowid
+
+
+def setze_manuellen_dienst(mitarbeiter_id: int, datum: str, zeit: tuple[str, str] | None) -> None:
+    """Trägt für einen Tag die "Tatsächlich"-Zeit direkt in der Abgleich-Maske
+    ein, ändert sie oder löscht sie (zeit=None). Ersetzt einen evtl. an diesem
+    Tag bereits vorhandenen Stärkemeldung-Eintrag dieses Mitarbeiters."""
+    con = get_connection()
+    try:
+        con.execute(
+            "DELETE FROM dienste WHERE mitarbeiter_id = ? AND datum = ? AND quelle = ?",
+            (mitarbeiter_id, datum, QUELLE_STAERKEMELDUNG),
+        )
+        if zeit is not None:
+            start_zeit, end_zeit = zeit
+            sh, sm = (int(t) for t in start_zeit.split(":"))
+            eh, em = (int(t) for t in end_zeit.split(":"))
+            start_dt = datetime.strptime(datum, "%Y-%m-%d").replace(hour=sh, minute=sm)
+            end_dt = start_dt.replace(hour=eh, minute=em)
+            if (eh, em) <= (sh, sm):
+                end_dt += timedelta(days=1)
+            dauer = int((end_dt - start_dt).total_seconds() // 60)
+            dok_id = _manueller_dokument_id(con)
+            con.execute(
+                """
+                INSERT INTO dienste (mitarbeiter_id, dokument_id, quelle, kategorie, datum,
+                                      start_zeit, end_zeit, end_datum, dauer_minuten)
+                VALUES (?, ?, ?, 'Manuell', ?, ?, ?, ?, ?)
+                """,
+                (mitarbeiter_id, dok_id, QUELLE_STAERKEMELDUNG, datum,
+                 start_zeit, end_zeit, end_dt.strftime("%Y-%m-%d"), dauer),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _gruppen_fuer_monat(jahr: int, monat: int):
+    """Lädt alle Dienst-Rohzeilen eines Monats und fasst sie (automatisch per
+    Namensvergleich + manuelle Zuordnung/Trennung) zu Mitarbeiter-Identitäten
+    zusammen. Rückgabe: (rows, gruppen_ids, gruppen_namen, up_gruppen,
+    sm_gruppen, id_zu_gruppe). Wird sowohl von berechne_abgleich als auch von
+    voller_monatsplan verwendet, damit beide dieselbe Gruppierung nutzen."""
     von, bis = _monatsgrenzen(jahr, monat)
     con = get_connection()
     try:
@@ -258,10 +395,6 @@ def berechne_abgleich(jahr: int, monat: int) -> AbgleichErgebnis:
             WHERE d.datum >= ? AND d.datum < ?
             """,
             (von, bis),
-        ).fetchall()
-
-        status_rows = con.execute(
-            "SELECT mitarbeiter_id, datum, art, status FROM abgleich_status"
         ).fetchall()
         manuelle_paare = con.execute(
             "SELECT mitarbeiter_id_a, mitarbeiter_id_b FROM abgleich_manuelle_zuordnung"
@@ -301,29 +434,58 @@ def berechne_abgleich(jahr: int, monat: int) -> AbgleichErgebnis:
         if r1 != r2:
             gruppen_eltern[r1] = r2
 
-    id_zu_gruppe: dict[int, int] = {r["mitarbeiter_id"]: gruppe_je_name[r["mitarbeiter"]] for r in rows}
+    id_zu_gruppe_vorlaeufig: dict[int, int] = {r["mitarbeiter_id"]: gruppe_je_name[r["mitarbeiter"]] for r in rows}
     for paar in manuelle_paare:
-        ga = id_zu_gruppe.get(paar["mitarbeiter_id_a"])
-        gb = id_zu_gruppe.get(paar["mitarbeiter_id_b"])
+        ga = id_zu_gruppe_vorlaeufig.get(paar["mitarbeiter_id_a"])
+        gb = id_zu_gruppe_vorlaeufig.get(paar["mitarbeiter_id_b"])
         if ga is not None and gb is not None:
             gunion(ga, gb)
 
     gruppen_ids: dict[int, set[int]] = {}
     gruppen_namen: dict[int, set[str]] = {}
-    up_tage: dict[int, dict[str, list[tuple[str, str]]]] = {}
-    sm_tage: dict[int, dict[str, list[tuple[str, str]]]] = {}
     up_gruppen: set[int] = set()
     sm_gruppen: set[int] = set()
+    id_zu_gruppe: dict[int, int] = {}
 
     for r in rows:
         gruppe = gfind(gruppe_je_name[r["mitarbeiter"]])
+        id_zu_gruppe[r["mitarbeiter_id"]] = gruppe
         gruppen_ids.setdefault(gruppe, set()).add(r["mitarbeiter_id"])
         gruppen_namen.setdefault(gruppe, set()).add(r["mitarbeiter"])
-        ziel = up_tage if r["quelle"] == QUELLE_URSPRUNGSPLANUNG else sm_tage
         ziel_gruppen = up_gruppen if r["quelle"] == QUELLE_URSPRUNGSPLANUNG else sm_gruppen
         ziel_gruppen.add(gruppe)
+
+    return rows, gruppen_ids, gruppen_namen, up_gruppen, sm_gruppen, id_zu_gruppe
+
+
+def berechne_abgleich(jahr: int, monat: int) -> AbgleichErgebnis:
+    """Vergleicht je Mitarbeiter und Tag die Ursprungsplanung mit den
+    Tagesdienstplänen. Mitarbeiter werden dabei anhand ihrer Namensbestandteile
+    zusammengeführt, auch wenn Ursprungsplanung und Tagesdienstpläne den Namen
+    unterschiedlich geschrieben oder unterschiedlich stark abgekürzt haben
+    (z. B. "Adrovic A." vs. "Adrian Adrovic" vs. nur "Adrovic", oder
+    "Bakkal Em" vs. "Emirhan Bakkal"). Mehrdeutige Namen (z. B. nur "Tunahan",
+    wenn es zwei unterschiedliche Personen mit Vorname Tunahan gibt) werden
+    NICHT geraten, sondern bleiben als eigener Mismatch stehen. Mitarbeiter
+    ohne Abweichungen werden nicht aufgeführt."""
+    rows, gruppen_ids, gruppen_namen, up_gruppen, sm_gruppen, id_zu_gruppe = _gruppen_fuer_monat(jahr, monat)
+
+    con = get_connection()
+    try:
+        status_rows = con.execute(
+            "SELECT mitarbeiter_id, datum, art, status FROM abgleich_status"
+        ).fetchall()
+    finally:
+        con.close()
+
+    up_tage: dict[int, dict[str, list[tuple[str, str]]]] = {}
+    sm_tage: dict[int, dict[str, list[tuple[str, str]]]] = {}
+    for r in rows:
+        gruppe = id_zu_gruppe[r["mitarbeiter_id"]]
+        ziel = up_tage if r["quelle"] == QUELLE_URSPRUNGSPLANUNG else sm_tage
         ziel.setdefault(gruppe, {}).setdefault(r["datum"], []).append((r["start_zeit"], r["end_zeit"]))
 
+    id_zu_name: dict[int, str] = {r["mitarbeiter_id"]: r["mitarbeiter"] for r in rows}
     status_lookup = {(r["mitarbeiter_id"], r["datum"], r["art"]): r["status"] for r in status_rows}
 
     ergebnis: list[MitarbeiterAbgleich] = []
@@ -395,6 +557,35 @@ def berechne_abgleich(jahr: int, monat: int) -> AbgleichErgebnis:
 
     ergebnis.sort(key=lambda ma: ma.name.lower())
     return AbgleichErgebnis(jahr=jahr, monat=monat, mitarbeiter=ergebnis)
+
+
+@dataclass
+class MitarbeiterMonatsplan:
+    mitarbeiter_id: int
+    name: str
+    mitarbeiter_ids: list[int]
+    tage: list[TagesZeile]
+
+
+def voller_monatsplan(jahr: int, monat: int) -> list[MitarbeiterMonatsplan]:
+    """Liefert für JEDEN Mitarbeiter mit Daten in diesem Monat (nicht nur die
+    mit Abweichungen) den vollen, editierten Monatsplan - Basis für den
+    Kalender-Tab und den Excel-/PDF-Export."""
+    _rows, gruppen_ids, gruppen_namen, up_gruppen, sm_gruppen, _id_zu_gruppe = _gruppen_fuer_monat(jahr, monat)
+
+    ergebnis: list[MitarbeiterMonatsplan] = []
+    for gruppe in sorted(up_gruppen | sm_gruppen):
+        alle_ids = sorted(gruppen_ids[gruppe])
+        anzeige_name = max(
+            sorted(gruppen_namen[gruppe]), key=lambda n: (_namens_vollstaendigkeit(n), len(n))
+        )
+        ergebnis.append(MitarbeiterMonatsplan(
+            mitarbeiter_id=min(alle_ids), name=anzeige_name, mitarbeiter_ids=alle_ids,
+            tage=monatsplan_fuer_mitarbeiter(jahr, monat, alle_ids),
+        ))
+
+    ergebnis.sort(key=lambda m: m.name.lower())
+    return ergebnis
 
 
 def set_eintrag_status(mitarbeiter_id: int, datum: str, art: str, status: str) -> None:
