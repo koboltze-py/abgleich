@@ -31,19 +31,36 @@ def _komponenten(name: str) -> list[str]:
 
 
 def _ist_kurzform(komponente: str) -> bool:
-    """Kürzel wie "A", "A.", "Em", "Ek" (Tagesdienstpläne kürzen Vor- ODER
-    Nachname unterschiedlich stark ab) - alles bis 2 Buchstaben (ohne Punkt)."""
+    """Kürzel wie "A", "A.", "Em", "Ek" - bis 2 Buchstaben (ohne Punkt)."""
     return len(komponente.rstrip(".")) <= 2
 
 
-def _komponenten_kompatibel(a: str, b: str) -> bool:
+def _kurzform_maske(komponenten: list[str]) -> list[bool]:
+    """Laut Konvention der Tagesdienstpläne wird bei doppelten Nachnamen immer
+    NUR der Vorname gekürzt, und zwar als letztes Wort des Namens. Das erste
+    Wort (bzw. ein alleinstehendes Wort) ist deshalb IMMER der vollständige
+    Nachname - auch wenn dieser selbst kurz ist (z. B. echte 2-Buchstaben-
+    Nachnamen wie "Su", "Oh"). Nur die letzte Komponente eines mehrteiligen
+    Namens kann also als Kürzel gelten."""
+    maske = [False] * len(komponenten)
+    if len(komponenten) >= 2 and _ist_kurzform(komponenten[-1]):
+        maske[-1] = True
+    return maske
+
+
+def _komponenten_kompatibel(a: str, a_kurz: bool, b: str, b_kurz: bool) -> bool:
     a, b = a.lower().rstrip("."), b.lower().rstrip(".")
     if a == b:
         return True
-    if _ist_kurzform(a) and b.startswith(a):
-        return True
-    if _ist_kurzform(b) and a.startswith(b):
-        return True
+    if a_kurz and b_kurz:
+        return a.startswith(b) or b.startswith(a)
+    # Ein Kürzel darf nur auf ein wirklich VOLLSTÄNDIGES Wort treffen (mehr als
+    # 2 Buchstaben) - sonst wären zwei zufällig kurze Wörter (z. B. der echte
+    # Nachname "Su" und das Kürzel "S." eines ANDEREN Namens) ununterscheidbar.
+    if a_kurz and not b_kurz:
+        return len(b) > 2 and b.startswith(a)
+    if b_kurz and not a_kurz:
+        return len(a) > 2 and a.startswith(b)
     return False
 
 
@@ -54,15 +71,31 @@ def _namen_gleiche_person(komponenten_a: list[str], komponenten_b: list[str]) ->
     if not komponenten_a or not komponenten_b:
         return False
     kurze, lange = (komponenten_a, komponenten_b) if len(komponenten_a) <= len(komponenten_b) else (komponenten_b, komponenten_a)
-    # Ein einzelner, vollständiger Namensbestandteil (z. B. bloßer Nachname
-    # "Adrovic") darf nur auf einen ebenfalls vollständigen Bestandteil der
-    # Gegenseite treffen - sonst würde ein zufälliges 2-Buchstaben-Präfix
-    # (z. B. "Kedik" vs. das Kürzel "Ke" in "Bakkal Ke") einen falschen Treffer erzeugen.
-    einzeln_vollstaendig = len(kurze) == 1 and not _ist_kurzform(kurze[0])
+    kurze_maske = _kurzform_maske(kurze)
+    lange_maske = _kurzform_maske(lange)
+    # Ein einzelner Namensbestandteil (kein zweites Wort zur Bestätigung, z. B.
+    # bloßer Nachname "Adrovic" oder "Su") darf nur auf ein ebenfalls
+    # vollständiges (nicht gekürztes) Wort der Gegenseite treffen - sonst würde
+    # ein zufälliges Präfix (z. B. "Kedik" vs. das Kürzel "Ke" in "Bakkal Ke",
+    # oder "Su" vs. das Kürzel in "Suna O.") einen falschen Treffer erzeugen.
+    nur_volles_ziel_erlaubt = len(kurze) == 1
+    letzter_index = len(lange) - 1
     for auswahl in permutations(range(len(lange)), len(kurze)):
-        if einzeln_vollstaendig and _ist_kurzform(lange[auswahl[0]]):
+        if nur_volles_ziel_erlaubt and lange_maske[auswahl[0]]:
             continue
-        if all(_komponenten_kompatibel(kurze[i], lange[auswahl[i]]) for i in range(len(kurze))):
+        # Ein Kürzel (Vorname-Abkürzung) darf nur an den Rand des anderen
+        # Namens andocken (erstes oder letztes Wort), niemals mitten in einen
+        # mehrteiligen Nachnamen hinein (sonst würde z. B. "Bakkal K." über
+        # "K." fälschlich auf das mittlere Wort "Karfouh" in "El Karfouh B." treffen).
+        if any(
+            kurze_maske[i] and 0 < auswahl[i] < letzter_index
+            for i in range(len(kurze))
+        ):
+            continue
+        if all(
+            _komponenten_kompatibel(kurze[i], kurze_maske[i], lange[auswahl[i]], lange_maske[auswahl[i]])
+            for i in range(len(kurze))
+        ):
             return True
     return False
 
@@ -71,7 +104,7 @@ def _namens_vollstaendigkeit(name: str) -> int:
     """Bewertet, wie aussagekräftig ein Name ist (für die Anzeige des
     zusammengeführten Mitarbeiters wird die aussagekräftigste Variante gewählt)."""
     komponenten = _komponenten(name)
-    if len(komponenten) >= 2 and not any(_ist_kurzform(k) for k in komponenten):
+    if len(komponenten) >= 2 and not any(_kurzform_maske(komponenten)):
         return 2
     if len(komponenten) >= 2:
         return 1
