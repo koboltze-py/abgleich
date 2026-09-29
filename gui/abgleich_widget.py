@@ -20,6 +20,7 @@ from gui.monatsuebersicht import MONATSNAMEN, WOCHENTAGE_KURZ
 from functions.abgleich_service import (
     berechne_abgleich, set_eintrag_status, set_status_fuer_mitarbeiter,
     get_letzte_position, set_letzte_position, get_verfuegbare_monate,
+    get_manuelle_zuordnungen, manuell_zusammenfuehren, manuelle_zuordnung_aufheben,
     ART_HINZUGEFUEGT, ART_ZEIT_GEAENDERT, ART_ENTFALLEN, STATUS_OFFEN, STATUS_ERLEDIGT,
 )
 from functions.dienste_service import get_dokumente
@@ -104,6 +105,7 @@ class AbgleichWidget(QWidget):
         links_layout.addWidget(links_kopf)
         self._mitarbeiter_liste = QListWidget()
         self._mitarbeiter_liste.setStyleSheet(f"border: 1px solid {FIORI_BORDER}; border-radius: 4px;")
+        self._mitarbeiter_liste.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._mitarbeiter_liste.currentItemChanged.connect(self._mitarbeiter_gewaehlt)
         links_layout.addWidget(self._mitarbeiter_liste, stretch=1)
         nav_zeile = QHBoxLayout()
@@ -112,6 +114,17 @@ class AbgleichWidget(QWidget):
         btn_naechster_offen.clicked.connect(self._naechster_offener)
         nav_zeile.addWidget(btn_naechster_offen)
         links_layout.addLayout(nav_zeile)
+
+        merge_zeile = QHBoxLayout()
+        btn_manuell_mergen = QPushButton("Ausgewählte zusammenführen (selbe Person)")
+        btn_manuell_mergen.setStyleSheet(button_secondary())
+        btn_manuell_mergen.clicked.connect(self._manuell_zusammenfuehren)
+        merge_zeile.addWidget(btn_manuell_mergen)
+        btn_manuell_trennen = QPushButton("Verknüpfung aufheben")
+        btn_manuell_trennen.setStyleSheet(button_secondary())
+        btn_manuell_trennen.clicked.connect(self._manuelle_verknuepfung_aufheben)
+        merge_zeile.addWidget(btn_manuell_trennen)
+        links_layout.addLayout(merge_zeile)
         splitter.addWidget(links)
 
         # --- rechte Seite: Änderungen des gewählten Mitarbeiters ---
@@ -123,6 +136,12 @@ class AbgleichWidget(QWidget):
         self._mitarbeiter_titel = QLabel("Bitte Mitarbeiter auswählen")
         self._mitarbeiter_titel.setStyleSheet(f"font-size: 15px; font-weight: bold; color: {FIORI_TEXT}; border: none;")
         rechts_layout.addWidget(self._mitarbeiter_titel)
+
+        self._varianten_label = QLabel("")
+        self._varianten_label.setWordWrap(True)
+        self._varianten_label.setStyleSheet(f"color: {FIORI_TEXT}; border: none;")
+        self._varianten_label.setVisible(False)
+        rechts_layout.addWidget(self._varianten_label)
 
         self._warnung_label = QLabel("")
         self._warnung_label.setWordWrap(True)
@@ -245,6 +264,12 @@ class AbgleichWidget(QWidget):
             return
 
         self._mitarbeiter_titel.setText(ma.name)
+        if len(ma.varianten) > 1:
+            self._varianten_label.setText("Zusammengeführt aus: " + ", ".join(ma.varianten))
+            self._varianten_label.setVisible(True)
+        else:
+            self._varianten_label.setVisible(False)
+
         if ma.nur_ursprungsplanung:
             self._warnung_label.setText(
                 "⚠ Für diesen Mitarbeiter liegen in diesem Monat nur Ursprungsplanung-Daten vor – "
@@ -361,6 +386,50 @@ class AbgleichWidget(QWidget):
             if self._ergebnis.mitarbeiter[index].anzahl_offen > 0:
                 self._mitarbeiter_liste.setCurrentRow(index)
                 return
+
+    # ------------------------------------------------------------------
+    def _ausgewaehlte_mitarbeiter(self) -> list:
+        if not self._ergebnis:
+            return []
+        ids = [item.data(Qt.ItemDataRole.UserRole) for item in self._mitarbeiter_liste.selectedItems()]
+        return [m for m in self._ergebnis.mitarbeiter if m.mitarbeiter_id in ids]
+
+    def _manuell_zusammenfuehren(self):
+        ausgewaehlt = self._ausgewaehlte_mitarbeiter()
+        if len(ausgewaehlt) < 2:
+            QMessageBox.information(
+                self, "Zusammenführen",
+                "Bitte mindestens zwei Mitarbeiter in der Liste auswählen (Strg+Klick), "
+                "die dieselbe Person sind."
+            )
+            return
+        basis = ausgewaehlt[0].mitarbeiter_id
+        for weitere in ausgewaehlt[1:]:
+            manuell_zusammenfuehren(basis, weitere.mitarbeiter_id)
+        self.aktualisieren()
+
+    def _manuelle_verknuepfung_aufheben(self):
+        if not self._ergebnis or self._aktueller_mitarbeiter_id is None:
+            return
+        ma = next((m for m in self._ergebnis.mitarbeiter if m.mitarbeiter_id == self._aktueller_mitarbeiter_id), None)
+        if not ma or len(ma.mitarbeiter_ids) < 2:
+            QMessageBox.information(self, "Verknüpfung aufheben", "Dieser Mitarbeiter hat keine manuelle Verknüpfung.")
+            return
+        eigene_ids = set(ma.mitarbeiter_ids)
+        betroffen = [
+            (a, b) for a, b in get_manuelle_zuordnungen()
+            if a in eigene_ids and b in eigene_ids
+        ]
+        if not betroffen:
+            QMessageBox.information(
+                self, "Verknüpfung aufheben",
+                "Diese Zusammenführung wurde automatisch erkannt und nicht manuell erstellt - "
+                "sie kann hier nicht aufgehoben werden."
+            )
+            return
+        for a, b in betroffen:
+            manuelle_zuordnung_aufheben(a, b)
+        self.aktualisieren()
 
     # ------------------------------------------------------------------
     def _dokumente_laden(self, jahr: int, monat: int):

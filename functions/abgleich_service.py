@@ -198,6 +198,8 @@ class MitarbeiterAbgleich:
     mitarbeiter_id: int
     name: str
     eintraege: list[AbgleichEintrag] = field(default_factory=list)
+    varianten: list[str] = field(default_factory=list)  # alle zusammengeführten Rohnamen
+    mitarbeiter_ids: list[int] = field(default_factory=list)  # alle zusammengeführten mitarbeiter_id
     nur_ursprungsplanung: bool = False  # keine Stärkemeldung-Daten im ganzen Monat gefunden
     nur_staerkemeldung: bool = False    # keine Ursprungsplanung-Daten im ganzen Monat gefunden
 
@@ -254,6 +256,9 @@ def berechne_abgleich(jahr: int, monat: int) -> AbgleichErgebnis:
         status_rows = con.execute(
             "SELECT mitarbeiter_id, datum, art, status FROM abgleich_status"
         ).fetchall()
+        manuelle_paare = con.execute(
+            "SELECT mitarbeiter_id_a, mitarbeiter_id_b FROM abgleich_manuelle_zuordnung"
+        ).fetchall()
     finally:
         con.close()
 
@@ -261,6 +266,29 @@ def berechne_abgleich(jahr: int, monat: int) -> AbgleichErgebnis:
     # unabhängig davon, unter welcher mitarbeiter_id/Schreibweise sie in den
     # beiden Quellen jeweils gespeichert sind.
     gruppe_je_name = _namen_gruppieren([r["mitarbeiter"] for r in rows])
+
+    # Manuelle Zuordnungen (vom Nutzer bestätigte Verknüpfungen, die die
+    # automatische Erkennung nicht selbst gefunden hat) über die automatischen
+    # Gruppen legen und ggf. mehrere Gruppen zu einer verschmelzen.
+    gruppen_eltern: dict[int, int] = {g: g for g in set(gruppe_je_name.values())}
+
+    def gfind(g: int) -> int:
+        while gruppen_eltern[g] != g:
+            gruppen_eltern[g] = gruppen_eltern[gruppen_eltern[g]]
+            g = gruppen_eltern[g]
+        return g
+
+    def gunion(g1: int, g2: int) -> None:
+        r1, r2 = gfind(g1), gfind(g2)
+        if r1 != r2:
+            gruppen_eltern[r1] = r2
+
+    id_zu_gruppe: dict[int, int] = {r["mitarbeiter_id"]: gruppe_je_name[r["mitarbeiter"]] for r in rows}
+    for paar in manuelle_paare:
+        ga = id_zu_gruppe.get(paar["mitarbeiter_id_a"])
+        gb = id_zu_gruppe.get(paar["mitarbeiter_id_b"])
+        if ga is not None and gb is not None:
+            gunion(ga, gb)
 
     gruppen_ids: dict[int, set[int]] = {}
     gruppen_namen: dict[int, set[str]] = {}
@@ -270,7 +298,7 @@ def berechne_abgleich(jahr: int, monat: int) -> AbgleichErgebnis:
     sm_gruppen: set[int] = set()
 
     for r in rows:
-        gruppe = gruppe_je_name[r["mitarbeiter"]]
+        gruppe = gfind(gruppe_je_name[r["mitarbeiter"]])
         gruppen_ids.setdefault(gruppe, set()).add(r["mitarbeiter_id"])
         gruppen_namen.setdefault(gruppe, set()).add(r["mitarbeiter"])
         ziel = up_tage if r["quelle"] == QUELLE_URSPRUNGSPLANUNG else sm_tage
@@ -319,14 +347,26 @@ def berechne_abgleich(jahr: int, monat: int) -> AbgleichErgebnis:
             continue  # kein Unterschied -> nicht Teil des Abarbeitungs-Workflows
 
         # kanonische mitarbeiter_id (kleinste id der Gruppe) für Statuspersistenz
-        canonical_id = min(gruppen_ids[gruppe])
-        anzeige_name = max(gruppen_namen[gruppe], key=lambda n: (_namens_vollstaendigkeit(n), len(n)))
+        alle_ids = gruppen_ids[gruppe]
+        canonical_id = min(alle_ids)
+        # bei Punktgleichstand alphabetisch entscheiden, damit die Anzeige
+        # reproduzierbar ist (unabhängig von der zufallsseed-abhängigen set-Reihenfolge)
+        anzeige_name = max(
+            sorted(gruppen_namen[gruppe]), key=lambda n: (_namens_vollstaendigkeit(n), len(n))
+        )
 
         for e in eintraege:
-            e.status = status_lookup.get((canonical_id, e.datum, e.art), STATUS_OFFEN)
+            # alle IDs der Gruppe prüfen (nicht nur die kanonische), damit ein
+            # Status auch nach nachträglichem manuellem Zusammenführen erhalten bleibt
+            e.status = next(
+                (status_lookup[(mid, e.datum, e.art)] for mid in alle_ids if (mid, e.datum, e.art) in status_lookup),
+                STATUS_OFFEN,
+            )
 
         ergebnis.append(MitarbeiterAbgleich(
             mitarbeiter_id=canonical_id, name=anzeige_name, eintraege=eintraege,
+            varianten=sorted(gruppen_namen[gruppe], key=str.lower),
+            mitarbeiter_ids=sorted(alle_ids),
             nur_ursprungsplanung=gruppe in up_gruppen and gruppe not in sm_gruppen,
             nur_staerkemeldung=gruppe in sm_gruppen and gruppe not in up_gruppen,
         ))
@@ -396,6 +436,49 @@ def set_letzte_position(jahr: int, monat: int, mitarbeiter_id: int) -> None:
                                                     aktualisiert_am = excluded.aktualisiert_am
             """,
             (jahr, monat, mitarbeiter_id, jetzt()),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_manuelle_zuordnungen() -> list[tuple[int, int]]:
+    """Alle vom Nutzer manuell bestätigten Mitarbeiter-Verknüpfungen."""
+    con = get_connection()
+    try:
+        rows = con.execute(
+            "SELECT mitarbeiter_id_a, mitarbeiter_id_b FROM abgleich_manuelle_zuordnung"
+        ).fetchall()
+        return [(r["mitarbeiter_id_a"], r["mitarbeiter_id_b"]) for r in rows]
+    finally:
+        con.close()
+
+
+def manuell_zusammenfuehren(mitarbeiter_id_a: int, mitarbeiter_id_b: int) -> None:
+    """Merkt zwei Mitarbeiter-Identitäten dauerhaft als dieselbe Person, auch
+    wenn die automatische Namenszuordnung sie nicht selbst verbunden hat."""
+    if mitarbeiter_id_a == mitarbeiter_id_b:
+        return
+    a, b = sorted((mitarbeiter_id_a, mitarbeiter_id_b))
+    con = get_connection()
+    try:
+        con.execute(
+            "INSERT OR IGNORE INTO abgleich_manuelle_zuordnung (mitarbeiter_id_a, mitarbeiter_id_b, erstellt_am) "
+            "VALUES (?, ?, ?)",
+            (a, b, jetzt()),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def manuelle_zuordnung_aufheben(mitarbeiter_id_a: int, mitarbeiter_id_b: int) -> None:
+    a, b = sorted((mitarbeiter_id_a, mitarbeiter_id_b))
+    con = get_connection()
+    try:
+        con.execute(
+            "DELETE FROM abgleich_manuelle_zuordnung WHERE mitarbeiter_id_a = ? AND mitarbeiter_id_b = ?",
+            (a, b),
         )
         con.commit()
     finally:

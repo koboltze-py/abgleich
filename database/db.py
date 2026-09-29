@@ -64,6 +64,16 @@ CREATE TABLE IF NOT EXISTS abgleich_fortschritt (
     aktualisiert_am TEXT NOT NULL,
     PRIMARY KEY (jahr, monat)
 );
+
+-- Manuelle Korrektur, wenn die automatische Namenszuordnung im Abgleich zwei
+-- Schreibweisen nicht selbst als dieselbe Person erkennen konnte (bleibt bei
+-- Reimporten erhalten, da an mitarbeiter_id statt an Namensstrings gebunden).
+CREATE TABLE IF NOT EXISTS abgleich_manuelle_zuordnung (
+    mitarbeiter_id_a INTEGER NOT NULL REFERENCES mitarbeiter(id) ON DELETE CASCADE,
+    mitarbeiter_id_b INTEGER NOT NULL REFERENCES mitarbeiter(id) ON DELETE CASCADE,
+    erstellt_am      TEXT NOT NULL,
+    PRIMARY KEY (mitarbeiter_id_a, mitarbeiter_id_b)
+);
 """
 
 # Spalten, die nachträglich zu bestehenden Datenbanken hinzugefügt wurden
