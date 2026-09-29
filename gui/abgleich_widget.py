@@ -668,6 +668,15 @@ class AbgleichWidget(QWidget):
             return tag.ursprung_start, tag.ursprung_end
         return None
 
+    @staticmethod
+    def _zellen_text(tag) -> str:
+        """Anzeigetext für Kalender/Excel/PDF: "Entfallen" bleibt sichtbar,
+        statt (wie bei einer reinen Zeitanzeige) einfach leer zu sein."""
+        if tag.art == ART_ENTFALLEN:
+            return "Entfallen"
+        zeit = AbgleichWidget._finale_zeit(tag)
+        return f"{zeit[0]}-{zeit[1]}" if zeit else ""
+
     def _kalender_befuellen(self, jahr: int, monat: int):
         self._kalender_jahr, self._kalender_monat = jahr, monat
         self._kalender_plan = voller_monatsplan(jahr, monat)
@@ -687,10 +696,10 @@ class AbgleichWidget(QWidget):
 
         for zeile, mitarbeiter in enumerate(self._kalender_plan):
             for spalte, tag in enumerate(mitarbeiter.tage):
-                zeit = self._finale_zeit(tag)
-                if not zeit:
+                text = self._zellen_text(tag)
+                if not text:
                     continue
-                item = QTableWidgetItem(f"{zeit[0]}-{zeit[1]}")
+                item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 farbe = ART_FARBE.get(tag.art)
                 if farbe:
@@ -732,9 +741,9 @@ class AbgleichWidget(QWidget):
         for zeile, mitarbeiter in enumerate(self._kalender_plan, start=2):
             ws.cell(row=zeile, column=1, value=mitarbeiter.name)
             for spalte, tag in enumerate(mitarbeiter.tage, start=2):
-                zeit = self._finale_zeit(tag)
-                if zeit:
-                    ws.cell(row=zeile, column=spalte, value=f"{zeit[0]}-{zeit[1]}")
+                text = self._zellen_text(tag)
+                if text:
+                    ws.cell(row=zeile, column=spalte, value=text)
 
         ws.freeze_panes = "B2"
         ws.column_dimensions["A"].width = 22
@@ -780,8 +789,7 @@ class AbgleichWidget(QWidget):
             for mitarbeiter in self._kalender_plan:
                 zellen = [f"<td style='{zellen_stil}'>{mitarbeiter.name}</td>"]
                 for tag in mitarbeiter.tage[start - 1:ende]:
-                    zeit = self._finale_zeit(tag)
-                    text = f"{zeit[0]}\u2013{zeit[1]}" if zeit else ""
+                    text = self._zellen_text(tag)
                     zellen.append(f"<td style='{zellen_stil}'>{text}</td>")
                 zeilen_html.append("<tr>" + "".join(zellen) + "</tr>")
             return (
