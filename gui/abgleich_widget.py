@@ -15,8 +15,8 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QSplitter, QMessageBox, QInputDialog, QTabWidget,
     QFileDialog,
 )
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QTextDocument
+from PySide6.QtCore import Qt, QUrl, QMarginsF
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QTextDocument, QPageSize
 from PySide6.QtPrintSupport import QPrinter
 
 from config import (
@@ -701,35 +701,70 @@ class AbgleichWidget(QWidget):
     def _pdf_schreiben(self, pfad: str):
         jahr, monat = self._kalender_jahr, self._kalender_monat
         anzahl_tage = calendar.monthrange(jahr, monat)[1]
-
-        kopf = "<tr><th>Mitarbeiter</th>" + "".join(
-            f"<th>{tag:02d}<br/>{WOCHENTAGE_KURZ[date(jahr, monat, tag).weekday()]}</th>"
-            for tag in range(1, anzahl_tage + 1)
-        ) + "</tr>"
-        zeilen_html = []
-        for mitarbeiter in self._kalender_plan:
-            zellen = [f"<td>{mitarbeiter.name}</td>"]
-            for tag in mitarbeiter.tage:
-                zeit = self._finale_zeit(tag)
-                zellen.append(f"<td>{zeit[0]}-{zeit[1]}</td>" if zeit else "<td></td>")
-            zeilen_html.append("<tr>" + "".join(zellen) + "</tr>")
-
-        html = (
-            "<html><body>"
-            f"<h3>Monatsplan {MONATSNAMEN[monat - 1]} {jahr}</h3>"
-            "<table border='1' cellspacing='0' cellpadding='3' style='font-size:7pt; border-collapse:collapse;'>"
-            f"{kopf}{''.join(zeilen_html)}"
-            "</table></body></html>"
-        )
-
-        dokument = QTextDocument()
-        dokument.setHtml(html)
+        zellen_stil = "white-space:nowrap; border:1px solid #999; padding:2px 6px;"
+        FONT_PT = 8
 
         drucker = QPrinter(QPrinter.PrinterMode.HighResolution)
         drucker.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
         drucker.setOutputFileName(pfad)
         layout = drucker.pageLayout()
+        layout.setPageSize(QPageSize(QPageSize.PageSizeId.A3))
         layout.setOrientation(layout.Orientation.Landscape)
+        layout.setMargins(QMarginsF(8, 8, 8, 8))
         drucker.setPageLayout(layout)
+        seiten_breite = drucker.pageRect(QPrinter.Unit.Point).width()
+
+        def tabelle_html(start: int, ende: int) -> str:
+            kopf = f"<tr><th style='{zellen_stil}'>Mitarbeiter</th>" + "".join(
+                f"<th style='{zellen_stil}'>{tag:02d}<br/>{WOCHENTAGE_KURZ[date(jahr, monat, tag).weekday()].upper()}</th>"
+                for tag in range(start, ende + 1)
+            ) + "</tr>"
+            zeilen_html = []
+            for mitarbeiter in self._kalender_plan:
+                zellen = [f"<td style='{zellen_stil}'>{mitarbeiter.name}</td>"]
+                for tag in mitarbeiter.tage[start - 1:ende]:
+                    zeit = self._finale_zeit(tag)
+                    text = f"{zeit[0]}\u2013{zeit[1]}" if zeit else ""
+                    zellen.append(f"<td style='{zellen_stil}'>{text}</td>")
+                zeilen_html.append("<tr>" + "".join(zellen) + "</tr>")
+            return (
+                f"<table cellspacing='0' cellpadding='0' style='border-collapse:collapse; font-size:{FONT_PT}pt;'>"
+                f"{kopf}{''.join(zeilen_html)}</table>"
+            )
+
+        def passt_in_seite(html_tabelle: str) -> bool:
+            test_dok = QTextDocument()
+            test_dok.setDefaultFont(QFont("Segoe UI", FONT_PT))
+            test_dok.setHtml(f"<html><body>{html_tabelle}</body></html>")
+            return test_dok.idealWidth() <= seiten_breite
+
+        # Ein volles Monatsraster (~30 Tage) ist selbst auf A3 querformat zu
+        # breit, um die Uhrzeiten ohne Zeilenumbruch lesbar darzustellen -
+        # daher in Tages-Blöcke aufteilen, die je auf eine eigene Seite passen.
+        # Die Blockgröße wird anhand der tatsächlichen Textbreite ermittelt,
+        # damit auf jedem Rechner (andere Schriftmetriken) nichts abgeschnitten wird.
+        bloecke = []
+        start = 1
+        while start <= anzahl_tage:
+            ende = anzahl_tage
+            html_tabelle = tabelle_html(start, ende)
+            while ende > start and not passt_in_seite(html_tabelle):
+                ende -= 1
+                html_tabelle = tabelle_html(start, ende)
+
+            seitenumbruch = "page-break-before:always;" if bloecke else ""
+            bloecke.append(
+                f"<div style='{seitenumbruch}'>"
+                f"<h3>Monatsplan {MONATSNAMEN[monat - 1]} {jahr} – Tage {start}–{ende}</h3>"
+                f"{html_tabelle}</div>"
+            )
+            start = ende + 1
+
+        html = "<html><body>" + "".join(bloecke) + "</body></html>"
+
+        dokument = QTextDocument()
+        dokument.setDefaultFont(QFont("Segoe UI", FONT_PT))
+        dokument.setHtml(html)
         dokument.print_(drucker)
+
 
