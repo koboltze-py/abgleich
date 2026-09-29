@@ -7,3 +7,6 @@ database/settings.json
 
 # Original-Excel-/Word-Exporte enthalten echte Mitarbeiternamen und Dienstpläne
 Daten/
+
+# Lokale Backups enthalten eine volle Kopie der Datenbank und Daten/
+Backup/
