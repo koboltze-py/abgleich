@@ -31,7 +31,7 @@ from functions.abgleich_service import (
     berechne_abgleich, set_eintrag_status, set_status_fuer_mitarbeiter,
     get_letzte_position, set_letzte_position, get_verfuegbare_monate,
     get_manuelle_zuordnungen, manuell_zusammenfuehren, manuelle_zuordnung_aufheben,
-    manuell_trennen, monatsplan_fuer_mitarbeiter, setze_manuellen_dienst,
+    manuell_trennen, monatsplan_fuer_mitarbeiter, setze_manuellen_dienst, setze_manuelle_art,
     voller_monatsplan,
     ART_HINZUGEFUEGT, ART_ZEIT_GEAENDERT, ART_ENTFALLEN, ART_UNVERAENDERT, ART_KEINE_DATEN,
     STATUS_OFFEN, STATUS_ERLEDIGT,
@@ -51,6 +51,8 @@ ART_FARBE = {
     ART_ENTFALLEN: FIORI_ERROR,
 }
 _DIFF_ARTEN = {ART_HINZUGEFUEGT, ART_ZEIT_GEAENDERT, ART_ENTFALLEN}
+# Reihenfolge der Auswahlmöglichkeiten im "Art"-Dropdown der Monatstabelle
+_ART_AUSWAHL = (ART_UNVERAENDERT, ART_HINZUGEFUEGT, ART_ZEIT_GEAENDERT, ART_ENTFALLEN, ART_KEINE_DATEN)
 
 
 def _hex_zu_rgba(hex_farbe: str, alpha: int) -> QColor:
@@ -198,7 +200,10 @@ class AbgleichWidget(QWidget):
         hinweis = QLabel(
             "Zeigt den vollen Monat, auch Tage ohne jede Meldung. In der Spalte \"Tatsächlich\" kann "
             "über die Kontrollbox eine Zeit aktiviert und per Uhrzeit-Auswahl eingetragen oder "
-            "korrigiert werden (Kontrollbox abwählen zum Löschen)."
+            "korrigiert werden (Kontrollbox abwählen zum Löschen). Die Spalte \"Art\" kann per Dropdown "
+            "von Hand auf einen anderen Wert gesetzt werden - z. B. um einen Tag ausdrücklich als "
+            "\"Entfallen\" zu markieren; dieser Tag wird dann auch im Kalender-Export (Excel/PDF) nicht "
+            "mehr mit einer Uhrzeit angezeigt."
         )
         hinweis.setWordWrap(True)
         hinweis.setStyleSheet(f"color: {FIORI_TEXT}; border: none;")
@@ -408,21 +413,32 @@ class AbgleichWidget(QWidget):
         for zeile, tag in enumerate(plan):
             wochentag = WOCHENTAGE_KURZ[date.fromisoformat(tag.datum).weekday()]
             ursprung = f"{tag.ursprung_start} – {tag.ursprung_end}" if tag.ursprung_start else "–"
+            farbe = ART_FARBE.get(tag.art)
 
-            werte = [tag.datum, wochentag, ART_LABEL[tag.art], ursprung]
-            for spalte, wert in enumerate(werte):
+            werte = [tag.datum, wochentag, ursprung]
+            for spalte, wert in zip((0, 1, 3), werte):
                 item = QTableWidgetItem(wert)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                farbe = ART_FARBE.get(tag.art)
                 if farbe:
                     item.setBackground(_hex_zu_rgba(farbe, 30))
                 self._tabelle.setItem(zeile, spalte, item)
+
+            art_combo = QComboBox()
+            for art_wert in _ART_AUSWAHL:
+                art_combo.addItem(ART_LABEL[art_wert], art_wert)
+            index = art_combo.findData(tag.art)
+            art_combo.setCurrentIndex(index if index >= 0 else 0)
+            if farbe:
+                art_combo.setStyleSheet(f"background-color: {_hex_zu_css_rgba(farbe, 60)};")
+            art_combo.currentIndexChanged.connect(
+                lambda _idx, datum=tag.datum, combo=art_combo: self._art_geaendert(datum, combo.currentData())
+            )
+            self._tabelle.setCellWidget(zeile, 2, art_combo)
 
             editor = ZeitBereichEditor(
                 tag.tatsaechlich_start, tag.tatsaechlich_end,
                 lambda zeit, datum=tag.datum: self._tatsaechlich_zeit_geaendert(datum, zeit),
             )
-            farbe = ART_FARBE.get(tag.art)
             if farbe:
                 css = _hex_zu_css_rgba(farbe, 60)
                 editor.setStyleSheet(f"background-color: {css};")
@@ -465,6 +481,12 @@ class AbgleichWidget(QWidget):
         if self._aktueller_mitarbeiter_id is None:
             return
         setze_manuellen_dienst(self._aktueller_mitarbeiter_id, datum, zeit)
+        self.aktualisieren()
+
+    def _art_geaendert(self, datum: str, art: str):
+        if self._aktueller_mitarbeiter_id is None:
+            return
+        setze_manuelle_art(self._aktueller_mitarbeiter_id, datum, art)
         self.aktualisieren()
 
     def _eintrag_status_aktualisieren(self, datum: str, art: str, status: str):
@@ -629,6 +651,8 @@ class AbgleichWidget(QWidget):
     # ------------------------------------------------------------------
     @staticmethod
     def _finale_zeit(tag) -> tuple[str, str] | None:
+        if tag.art == ART_ENTFALLEN:
+            return None
         if tag.tatsaechlich_start:
             return tag.tatsaechlich_start, tag.tatsaechlich_end
         if tag.ursprung_start:

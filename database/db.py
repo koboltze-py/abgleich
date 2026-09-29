@@ -83,6 +83,16 @@ CREATE TABLE IF NOT EXISTS abgleich_manuelle_trennung (
     erstellt_am      TEXT NOT NULL,
     PRIMARY KEY (mitarbeiter_id_a, mitarbeiter_id_b)
 );
+
+-- Manuelle Übersteuerung der automatisch ermittelten "Art" eines Tages (z. B.
+-- um einen Tag ausdrücklich als "Entfallen" zu markieren), überlebt Reimporte.
+CREATE TABLE IF NOT EXISTS abgleich_manuelle_art (
+    mitarbeiter_id INTEGER NOT NULL REFERENCES mitarbeiter(id) ON DELETE CASCADE,
+    datum          TEXT NOT NULL,
+    art            TEXT NOT NULL,
+    gesetzt_am     TEXT NOT NULL,
+    PRIMARY KEY (mitarbeiter_id, datum)
+);
 """
 
 # Spalten, die nachträglich zu bestehenden Datenbanken hinzugefügt wurden

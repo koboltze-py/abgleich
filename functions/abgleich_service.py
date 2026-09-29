@@ -294,6 +294,10 @@ def monatsplan_fuer_mitarbeiter(jahr: int, monat: int, mitarbeiter_ids: list[int
             f"SELECT datum, art, status FROM abgleich_status WHERE mitarbeiter_id IN ({platzhalter})",
             mitarbeiter_ids,
         ).fetchall()
+        art_rows = con.execute(
+            f"SELECT datum, art FROM abgleich_manuelle_art WHERE mitarbeiter_id IN ({platzhalter})",
+            mitarbeiter_ids,
+        ).fetchall()
     finally:
         con.close()
 
@@ -304,6 +308,7 @@ def monatsplan_fuer_mitarbeiter(jahr: int, monat: int, mitarbeiter_ids: list[int
         ziel.setdefault(r["datum"], (r["start_zeit"], r["end_zeit"]))
 
     status_lookup = {(r["datum"], r["art"]): r["status"] for r in status_rows}
+    manuelle_art_lookup = {r["datum"]: r["art"] for r in art_rows}
 
     anzahl_tage = calendar.monthrange(jahr, monat)[1]
     ergebnis: list[TagesZeile] = []
@@ -322,6 +327,8 @@ def monatsplan_fuer_mitarbeiter(jahr: int, monat: int, mitarbeiter_ids: list[int
             art = ART_ENTFALLEN
         else:
             art = ART_ZEIT_GEAENDERT
+
+        art = manuelle_art_lookup.get(datum, art)
 
         ergebnis.append(TagesZeile(
             datum=datum,
@@ -372,6 +379,32 @@ def setze_manuellen_dienst(mitarbeiter_id: int, datum: str, zeit: tuple[str, str
                 """,
                 (mitarbeiter_id, dok_id, QUELLE_STAERKEMELDUNG, datum,
                  start_zeit, end_zeit, end_dt.strftime("%Y-%m-%d"), dauer),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def setze_manuelle_art(mitarbeiter_id: int, datum: str, art: str | None) -> None:
+    """Übersteuert von Hand die für einen Tag ermittelte "Art" (z. B. um einen
+    Tag ausdrücklich als "Entfallen" zu markieren, auch wenn dies nicht der
+    automatisch berechnete Wert war). art=None hebt die Übersteuerung wieder
+    auf (zurück zum automatisch berechneten Wert)."""
+    con = get_connection()
+    try:
+        if art is None:
+            con.execute(
+                "DELETE FROM abgleich_manuelle_art WHERE mitarbeiter_id = ? AND datum = ?",
+                (mitarbeiter_id, datum),
+            )
+        else:
+            con.execute(
+                """
+                INSERT INTO abgleich_manuelle_art (mitarbeiter_id, datum, art, gesetzt_am)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(mitarbeiter_id, datum) DO UPDATE SET art = excluded.art, gesetzt_am = excluded.gesetzt_am
+                """,
+                (mitarbeiter_id, datum, art, jetzt()),
             )
         con.commit()
     finally:
