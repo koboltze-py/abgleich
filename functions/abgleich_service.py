@@ -6,6 +6,7 @@ bearbeiteter Mitarbeiter je Monat).
 """
 import re
 from dataclasses import dataclass, field
+from itertools import permutations
 
 from config import QUELLE_STAERKEMELDUNG, QUELLE_URSPRUNGSPLANUNG
 from database.db import get_connection, jetzt
@@ -20,35 +21,132 @@ STATUS_ERLEDIGT = "erledigt"
 _INITIALE_RE = re.compile(r"^[A-ZÄÖÜ]\.?$")
 
 
-def _nachname_schluessel(name: str) -> str:
-    """Extrahiert einen Nachnamen-Schlüssel aus unterschiedlichen Namensformaten
-    ("Nachname, Vorname", "Nachname V.", "Vorname Nachname", nur "Nachname"),
-    damit dieselbe Person trotz unterschiedlicher Schreibweise in Ursprungs-
-    planung und Tagesdienstplänen als ein Mitarbeiter erkannt wird."""
+def _komponenten(name: str) -> list[str]:
+    """Zerlegt einen Namen in seine Bestandteile, unabhängig von der Reihenfolge
+    (Nachname zuerst/zuletzt) und davon, welcher Teil abgekürzt wurde."""
     name = name.strip()
     if "," in name:
-        return name.split(",", 1)[0].strip().lower()
-    tokens = name.split()
-    if not tokens:
-        return name.lower()
-    if len(tokens) == 1:
-        return tokens[0].lower()
-    if _INITIALE_RE.match(tokens[-1]):
-        return " ".join(tokens[:-1]).lower()  # "Nachname V."
-    return tokens[-1].lower()  # "Vorname Nachname" -> letztes Wort ist der Nachname
+        return [t.strip() for t in name.split(",", 1) if t.strip()]
+    return name.split()
+
+
+def _ist_kurzform(komponente: str) -> bool:
+    """Kürzel wie "A", "A.", "Em", "Ek" (Tagesdienstpläne kürzen Vor- ODER
+    Nachname unterschiedlich stark ab) - alles bis 2 Buchstaben (ohne Punkt)."""
+    return len(komponente.rstrip(".")) <= 2
+
+
+def _komponenten_kompatibel(a: str, b: str) -> bool:
+    a, b = a.lower().rstrip("."), b.lower().rstrip(".")
+    if a == b:
+        return True
+    if _ist_kurzform(a) and b.startswith(a):
+        return True
+    if _ist_kurzform(b) and a.startswith(b):
+        return True
+    return False
+
+
+def _namen_gleiche_person(komponenten_a: list[str], komponenten_b: list[str]) -> bool:
+    """Prüft, ob sich die (kürzere) Komponentenliste vollständig und eindeutig
+    auf unterschiedliche Komponenten der anderen Liste abbilden lässt (z. B.
+    "Bakkal"+"Em" auf "Emirhan"+"Bakkal", aber NICHT auf "Kerim"+"Bakkal")."""
+    if not komponenten_a or not komponenten_b:
+        return False
+    kurze, lange = (komponenten_a, komponenten_b) if len(komponenten_a) <= len(komponenten_b) else (komponenten_b, komponenten_a)
+    # Ein einzelner, vollständiger Namensbestandteil (z. B. bloßer Nachname
+    # "Adrovic") darf nur auf einen ebenfalls vollständigen Bestandteil der
+    # Gegenseite treffen - sonst würde ein zufälliges 2-Buchstaben-Präfix
+    # (z. B. "Kedik" vs. das Kürzel "Ke" in "Bakkal Ke") einen falschen Treffer erzeugen.
+    einzeln_vollstaendig = len(kurze) == 1 and not _ist_kurzform(kurze[0])
+    for auswahl in permutations(range(len(lange)), len(kurze)):
+        if einzeln_vollstaendig and _ist_kurzform(lange[auswahl[0]]):
+            continue
+        if all(_komponenten_kompatibel(kurze[i], lange[auswahl[i]]) for i in range(len(kurze))):
+            return True
+    return False
 
 
 def _namens_vollstaendigkeit(name: str) -> int:
     """Bewertet, wie aussagekräftig ein Name ist (für die Anzeige des
     zusammengeführten Mitarbeiters wird die aussagekräftigste Variante gewählt)."""
-    if "," in name:
+    komponenten = _komponenten(name)
+    if len(komponenten) >= 2 and not any(_ist_kurzform(k) for k in komponenten):
         return 2
-    tokens = name.split()
-    if len(tokens) >= 2 and not _INITIALE_RE.match(tokens[-1]):
-        return 2
-    if len(tokens) >= 2:
+    if len(komponenten) >= 2:
         return 1
     return 0
+
+
+def _namen_gruppieren(namen: list[str]) -> dict[str, int]:
+    """Führt unterschiedlich geschriebene Namen zusammen, die vermutlich
+    dieselbe Person meinen - aber nur, wenn die Zuordnung eindeutig ist.
+
+    Baut einen Kompatibilitätsgraphen und fasst jede zusammenhängende
+    Namensgruppe zu einer Person zusammen, WENN diese Gruppe eine Clique ist
+    (jeder Name ist mit jedem anderen kompatibel). Ist das nicht der Fall,
+    verbindet vermutlich ein mehrdeutiger "Sammel"-Name (z. B. nur ein
+    Nachname wie "El Karfouh" oder nur ein Vorname wie "Tunahan", der auf
+    mehrere unterschiedliche Personen passen könnte) zwei eigentlich getrennte
+    Personen. Ein solcher Knoten (der mit den meisten anderen in der Gruppe
+    kompatibel ist) wird isoliert und bleibt als eigener, zu prüfender
+    Mismatch stehen; der Rest wird rekursiv neu aufgeteilt."""
+    eindeutige_namen = list(dict.fromkeys(namen))
+    komponenten = {n: _komponenten(n) for n in eindeutige_namen}
+
+    kompatibel: dict[str, set[str]] = {n: set() for n in eindeutige_namen}
+    for i, a in enumerate(eindeutige_namen):
+        for b in eindeutige_namen[i + 1:]:
+            if _namen_gleiche_person(komponenten[a], komponenten[b]):
+                kompatibel[a].add(b)
+                kompatibel[b].add(a)
+
+    gruppen_index: dict[str, int] = {}
+    naechster_index = 0
+
+    def zusammenhang_finden(start: str, uebrig: set[str]) -> set[str]:
+        besucht = {start}
+        stapel = [start]
+        while stapel:
+            n = stapel.pop()
+            for m in kompatibel[n] & uebrig:
+                if m not in besucht:
+                    besucht.add(m)
+                    stapel.append(m)
+        return besucht
+
+    def ist_clique(knoten: set[str]) -> bool:
+        return all((knoten - {n}) <= kompatibel[n] for n in knoten)
+
+    def verarbeiten(knoten: set[str]) -> None:
+        nonlocal naechster_index
+        if not knoten:
+            return
+        if len(knoten) == 1 or ist_clique(knoten):
+            for n in knoten:
+                gruppen_index[n] = naechster_index
+            naechster_index += 1
+            return
+        # kein eindeutiger Fall: den am stärksten vernetzten (vermutlich
+        # mehrdeutigen) Knoten isolieren und den Rest neu aufteilen. Bei Gleichstand
+        # wird alphabetisch entschieden, damit das Ergebnis reproduzierbar ist
+        # (unabhängig von der zufallsseed-abhängigen set-Reihenfolge).
+        hub = max(sorted(knoten), key=lambda n: len(kompatibel[n] & knoten))
+        gruppen_index[hub] = naechster_index
+        naechster_index += 1
+        rest = knoten - {hub}
+        while rest:
+            teil = zusammenhang_finden(min(rest), rest)
+            rest -= teil
+            verarbeiten(teil)
+
+    unbesucht = set(eindeutige_namen)
+    while unbesucht:
+        komponente = zusammenhang_finden(min(unbesucht), unbesucht)
+        unbesucht -= komponente
+        verarbeiten(komponente)
+
+    return gruppen_index
 
 
 @dataclass
@@ -99,11 +197,14 @@ def _monatsgrenzen(jahr: int, monat: int) -> tuple[str, str]:
 
 def berechne_abgleich(jahr: int, monat: int) -> AbgleichErgebnis:
     """Vergleicht je Mitarbeiter und Tag die Ursprungsplanung mit den
-    Tagesdienstplänen. Mitarbeiter werden dabei anhand des Nachnamens
-    zusammengeführt, auch wenn Ursprungsplanung und Tagesdienstpläne den
-    Namen unterschiedlich geschrieben haben (z. B. "Adrovic A." vs.
-    "Adrian Adrovic" vs. nur "Adrovic"). Mitarbeiter ohne Abweichungen
-    werden nicht aufgeführt."""
+    Tagesdienstplänen. Mitarbeiter werden dabei anhand ihrer Namensbestandteile
+    zusammengeführt, auch wenn Ursprungsplanung und Tagesdienstpläne den Namen
+    unterschiedlich geschrieben oder unterschiedlich stark abgekürzt haben
+    (z. B. "Adrovic A." vs. "Adrian Adrovic" vs. nur "Adrovic", oder
+    "Bakkal Em" vs. "Emirhan Bakkal"). Mehrdeutige Namen (z. B. nur "Tunahan",
+    wenn es zwei unterschiedliche Personen mit Vorname Tunahan gibt) werden
+    NICHT geraten, sondern bleiben als eigener Mismatch stehen. Mitarbeiter
+    ohne Abweichungen werden nicht aufgeführt."""
     von, bis = _monatsgrenzen(jahr, monat)
     con = get_connection()
     try:
@@ -123,31 +224,33 @@ def berechne_abgleich(jahr: int, monat: int) -> AbgleichErgebnis:
     finally:
         con.close()
 
-    # Zeilen anhand des Nachnamen-Schlüssels zu einer Person zusammenführen,
+    # Rohnamen zu Gruppen (vermutlich dieselbe Person) zusammenführen,
     # unabhängig davon, unter welcher mitarbeiter_id/Schreibweise sie in den
     # beiden Quellen jeweils gespeichert sind.
-    gruppen_ids: dict[str, set[int]] = {}
-    gruppen_namen: dict[str, set[str]] = {}
-    up_tage: dict[str, dict[str, list[tuple[str, str]]]] = {}
-    sm_tage: dict[str, dict[str, list[tuple[str, str]]]] = {}
-    up_schluessel: set[str] = set()
-    sm_schluessel: set[str] = set()
+    gruppe_je_name = _namen_gruppieren([r["mitarbeiter"] for r in rows])
+
+    gruppen_ids: dict[int, set[int]] = {}
+    gruppen_namen: dict[int, set[str]] = {}
+    up_tage: dict[int, dict[str, list[tuple[str, str]]]] = {}
+    sm_tage: dict[int, dict[str, list[tuple[str, str]]]] = {}
+    up_gruppen: set[int] = set()
+    sm_gruppen: set[int] = set()
 
     for r in rows:
-        schluessel = _nachname_schluessel(r["mitarbeiter"])
-        gruppen_ids.setdefault(schluessel, set()).add(r["mitarbeiter_id"])
-        gruppen_namen.setdefault(schluessel, set()).add(r["mitarbeiter"])
+        gruppe = gruppe_je_name[r["mitarbeiter"]]
+        gruppen_ids.setdefault(gruppe, set()).add(r["mitarbeiter_id"])
+        gruppen_namen.setdefault(gruppe, set()).add(r["mitarbeiter"])
         ziel = up_tage if r["quelle"] == QUELLE_URSPRUNGSPLANUNG else sm_tage
-        ziel_schluessel = up_schluessel if r["quelle"] == QUELLE_URSPRUNGSPLANUNG else sm_schluessel
-        ziel_schluessel.add(schluessel)
-        ziel.setdefault(schluessel, {}).setdefault(r["datum"], []).append((r["start_zeit"], r["end_zeit"]))
+        ziel_gruppen = up_gruppen if r["quelle"] == QUELLE_URSPRUNGSPLANUNG else sm_gruppen
+        ziel_gruppen.add(gruppe)
+        ziel.setdefault(gruppe, {}).setdefault(r["datum"], []).append((r["start_zeit"], r["end_zeit"]))
 
     status_lookup = {(r["mitarbeiter_id"], r["datum"], r["art"]): r["status"] for r in status_rows}
 
     ergebnis: list[MitarbeiterAbgleich] = []
-    for schluessel in sorted(up_schluessel | sm_schluessel):
-        up_pro_tag = up_tage.get(schluessel, {})
-        sm_pro_tag = sm_tage.get(schluessel, {})
+    for gruppe in sorted(up_gruppen | sm_gruppen):
+        up_pro_tag = up_tage.get(gruppe, {})
+        sm_pro_tag = sm_tage.get(gruppe, {})
         alle_tage = sorted(set(up_pro_tag) | set(sm_pro_tag))
 
         eintraege: list[AbgleichEintrag] = []
@@ -183,16 +286,16 @@ def berechne_abgleich(jahr: int, monat: int) -> AbgleichErgebnis:
             continue  # kein Unterschied -> nicht Teil des Abarbeitungs-Workflows
 
         # kanonische mitarbeiter_id (kleinste id der Gruppe) für Statuspersistenz
-        canonical_id = min(gruppen_ids[schluessel])
-        anzeige_name = max(gruppen_namen[schluessel], key=lambda n: (_namens_vollstaendigkeit(n), len(n)))
+        canonical_id = min(gruppen_ids[gruppe])
+        anzeige_name = max(gruppen_namen[gruppe], key=lambda n: (_namens_vollstaendigkeit(n), len(n)))
 
         for e in eintraege:
             e.status = status_lookup.get((canonical_id, e.datum, e.art), STATUS_OFFEN)
 
         ergebnis.append(MitarbeiterAbgleich(
             mitarbeiter_id=canonical_id, name=anzeige_name, eintraege=eintraege,
-            nur_ursprungsplanung=schluessel in up_schluessel and schluessel not in sm_schluessel,
-            nur_staerkemeldung=schluessel in sm_schluessel and schluessel not in up_schluessel,
+            nur_ursprungsplanung=gruppe in up_gruppen and gruppe not in sm_gruppen,
+            nur_staerkemeldung=gruppe in sm_gruppen and gruppe not in up_gruppen,
         ))
 
     ergebnis.sort(key=lambda ma: ma.name.lower())
