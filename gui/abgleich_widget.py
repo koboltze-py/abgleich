@@ -21,7 +21,7 @@ from PySide6.QtPrintSupport import QPrinter
 
 from config import (
     FIORI_TEXT, FIORI_SUCCESS, FIORI_WARNING, FIORI_ERROR, FIORI_BORDER,
-    QUELLE_STAERKEMELDUNG,
+    FIORI_LIGHT_BLUE, QUELLE_STAERKEMELDUNG,
 )
 from gui.styles import table_style, button_primary, button_secondary, card_style
 from gui.widgets import ZeitBereichEditor
@@ -61,9 +61,15 @@ def _hex_zu_rgba(hex_farbe: str, alpha: int) -> QColor:
     return c
 
 
-def _hex_zu_css_rgba(hex_farbe: str, alpha: int) -> str:
+def _hex_zu_css_solid(hex_farbe: str, staerke: int) -> str:
+    """Mit Weiß gemischte, undurchsichtige Variante der Farbe (statt echter
+    Transparenz) - Cell-Widgets wie QComboBox rendern mit echter rgba-
+    Transparenz in QTableWidget-Zellen fehlerhaft (überlappender Text von
+    zuvor gezeichneten Widgets scheint durch)."""
     c = QColor(hex_farbe)
-    return f"rgba({c.red()}, {c.green()}, {c.blue()}, {alpha})"
+    t = staerke / 255
+    mix = lambda kanal: round(kanal * t + 255 * (1 - t))
+    return f"rgb({mix(c.red())}, {mix(c.green())}, {mix(c.blue())})"
 
 
 class AbgleichWidget(QWidget):
@@ -428,8 +434,12 @@ class AbgleichWidget(QWidget):
                 art_combo.addItem(ART_LABEL[art_wert], art_wert)
             index = art_combo.findData(tag.art)
             art_combo.setCurrentIndex(index if index >= 0 else 0)
-            if farbe:
-                art_combo.setStyleSheet(f"background-color: {_hex_zu_css_rgba(farbe, 60)};")
+            hintergrund = _hex_zu_css_solid(farbe, 60) if farbe else "#ffffff"
+            art_combo.setStyleSheet(
+                f"QComboBox {{ background-color: {hintergrund}; }}"
+                f"QComboBox QAbstractItemView {{ background-color: #ffffff; color: {FIORI_TEXT}; "
+                f"selection-background-color: {FIORI_LIGHT_BLUE}; selection-color: {FIORI_TEXT}; }}"
+            )
             art_combo.currentIndexChanged.connect(
                 lambda _idx, datum=tag.datum, combo=art_combo: self._art_geaendert(datum, combo.currentData())
             )
@@ -440,8 +450,7 @@ class AbgleichWidget(QWidget):
                 lambda zeit, datum=tag.datum: self._tatsaechlich_zeit_geaendert(datum, zeit),
             )
             if farbe:
-                css = _hex_zu_css_rgba(farbe, 60)
-                editor.setStyleSheet(f"background-color: {css};")
+                editor.setStyleSheet(f"background-color: {_hex_zu_css_solid(farbe, 60)};")
             self._tabelle.setCellWidget(zeile, 4, editor)
 
             status_item = QTableWidgetItem()
