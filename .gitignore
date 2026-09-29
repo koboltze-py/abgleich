@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+# Lokale SQLite-Datenbank und Einstellungen enthalten echte Mitarbeiterdaten
+database/abgleich.db
+database/settings.json
+
+# Original-Excel-/Word-Exporte enthalten echte Mitarbeiternamen und Dienstpläne
+Daten/

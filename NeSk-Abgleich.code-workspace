@@ -1,0 +1,24 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"python.defaultInterpreterPath": "C:\\Users\\DRKairport\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe"
+	},
+	"launch": {
+		"version": "0.2.0",
+		"configurations": [
+			{
+				"name": "NeSk Abgleich starten",
+				"type": "debugpy",
+				"request": "launch",
+				"program": "${workspaceFolder}/main.py",
+				"console": "integratedTerminal",
+				"cwd": "${workspaceFolder}",
+				"justMyCode": true
+			}
+		]
+	}
+}

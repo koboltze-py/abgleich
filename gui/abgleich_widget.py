@@ -1,0 +1,348 @@
+"""
+Abgleich-Workflow: vergleicht Ursprungsplanung und Tagesdienstpläne je
+Mitarbeiter und ermöglicht das geordnete Abarbeiten der gefundenen
+Abweichungen (neue Dienste, geänderte Zeiten, entfallene Dienste).
+"""
+from datetime import date
+
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
+    QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem, QFrame,
+    QAbstractItemView, QSplitter,
+)
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
+
+from config import FIORI_TEXT, FIORI_SUCCESS, FIORI_WARNING, FIORI_ERROR, FIORI_BORDER
+from gui.styles import table_style, button_primary, button_secondary, card_style
+from gui.monatsuebersicht import MONATSNAMEN, WOCHENTAGE_KURZ
+from functions.abgleich_service import (
+    berechne_abgleich, set_eintrag_status, set_status_fuer_mitarbeiter,
+    get_letzte_position, set_letzte_position, get_verfuegbare_monate,
+    ART_HINZUGEFUEGT, ART_ZEIT_GEAENDERT, ART_ENTFALLEN, STATUS_OFFEN, STATUS_ERLEDIGT,
+)
+
+ART_LABEL = {
+    ART_HINZUGEFUEGT: "Hinzugekommen",
+    ART_ZEIT_GEAENDERT: "Zeit geändert",
+    ART_ENTFALLEN: "Entfallen",
+}
+ART_FARBE = {
+    ART_HINZUGEFUEGT: FIORI_SUCCESS,
+    ART_ZEIT_GEAENDERT: FIORI_WARNING,
+    ART_ENTFALLEN: FIORI_ERROR,
+}
+
+
+def _hex_zu_rgba(hex_farbe: str, alpha: int) -> QColor:
+    c = QColor(hex_farbe)
+    c.setAlpha(alpha)
+    return c
+
+
+class AbgleichWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._ergebnis = None
+        self._aktueller_mitarbeiter_id: int | None = None
+        self._aufbauen()
+        self.aktualisieren()
+
+    # ------------------------------------------------------------------
+    def _aufbauen(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(12)
+
+        titel = QLabel("Abgleich – Ursprungsplanung vs. Tagesdienstpläne")
+        titel.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {FIORI_TEXT};")
+        layout.addWidget(titel)
+
+        hinweis = QLabel(
+            "Zeigt je Mitarbeiter, welche Dienste gegenüber der Ursprungsplanung hinzugekommen, "
+            "zeitlich verändert oder entfallen sind. Bearbeitete Änderungen können hier als "
+            "erledigt markiert werden, sobald sie in die externe Liste übertragen wurden."
+        )
+        hinweis.setWordWrap(True)
+        hinweis.setStyleSheet(f"color: {FIORI_TEXT};")
+        layout.addWidget(hinweis)
+
+        filter_zeile = QHBoxLayout()
+        filter_zeile.addWidget(QLabel("Monat:"))
+        self._monat_combo = QComboBox()
+        self._monat_combo.currentIndexChanged.connect(self._monat_gewechselt)
+        filter_zeile.addWidget(self._monat_combo)
+        filter_zeile.addStretch()
+        self._status_label = QLabel("")
+        self._status_label.setStyleSheet(f"color: {FIORI_TEXT};")
+        filter_zeile.addWidget(self._status_label)
+        layout.addLayout(filter_zeile)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(splitter, stretch=1)
+
+        # --- linke Seite: Mitarbeiterliste mit Fortschritt ---
+        links = QFrame()
+        links.setStyleSheet(card_style())
+        links_layout = QVBoxLayout(links)
+        links_layout.setContentsMargins(10, 10, 10, 10)
+        links_kopf = QLabel("Mitarbeiter mit Abweichungen")
+        links_kopf.setStyleSheet(f"font-weight: bold; color: {FIORI_TEXT}; border: none;")
+        links_layout.addWidget(links_kopf)
+        self._mitarbeiter_liste = QListWidget()
+        self._mitarbeiter_liste.setStyleSheet(f"border: 1px solid {FIORI_BORDER}; border-radius: 4px;")
+        self._mitarbeiter_liste.currentItemChanged.connect(self._mitarbeiter_gewaehlt)
+        links_layout.addWidget(self._mitarbeiter_liste, stretch=1)
+        nav_zeile = QHBoxLayout()
+        btn_naechster_offen = QPushButton("Nächster mit offenen Punkten")
+        btn_naechster_offen.setStyleSheet(button_secondary())
+        btn_naechster_offen.clicked.connect(self._naechster_offener)
+        nav_zeile.addWidget(btn_naechster_offen)
+        links_layout.addLayout(nav_zeile)
+        splitter.addWidget(links)
+
+        # --- rechte Seite: Änderungen des gewählten Mitarbeiters ---
+        rechts = QFrame()
+        rechts.setStyleSheet(card_style())
+        rechts_layout = QVBoxLayout(rechts)
+        rechts_layout.setContentsMargins(10, 10, 10, 10)
+
+        self._mitarbeiter_titel = QLabel("Bitte Mitarbeiter auswählen")
+        self._mitarbeiter_titel.setStyleSheet(f"font-size: 15px; font-weight: bold; color: {FIORI_TEXT}; border: none;")
+        rechts_layout.addWidget(self._mitarbeiter_titel)
+
+        self._warnung_label = QLabel("")
+        self._warnung_label.setWordWrap(True)
+        self._warnung_label.setStyleSheet(f"color: {FIORI_ERROR}; font-weight: bold; border: none;")
+        self._warnung_label.setVisible(False)
+        rechts_layout.addWidget(self._warnung_label)
+
+        self._tabelle = QTableWidget(0, 6)
+        self._tabelle.setHorizontalHeaderLabels(
+            ["Datum", "Wochentag", "Art", "Ursprünglich", "Tatsächlich", "Erledigt"]
+        )
+        self._tabelle.setStyleSheet(table_style())
+        self._tabelle.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._tabelle.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._tabelle.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._tabelle.horizontalHeader().setStretchLastSection(False)
+        self._tabelle.itemChanged.connect(self._status_geaendert)
+        rechts_layout.addWidget(self._tabelle, stretch=1)
+
+        aktion_zeile = QHBoxLayout()
+        btn_ausgewaehlt_erledigt = QPushButton("Ausgewählte als erledigt markieren")
+        btn_ausgewaehlt_erledigt.setStyleSheet(button_secondary())
+        btn_ausgewaehlt_erledigt.clicked.connect(lambda: self._markieren(STATUS_ERLEDIGT, nur_auswahl=True))
+        aktion_zeile.addWidget(btn_ausgewaehlt_erledigt)
+
+        btn_alle_erledigt = QPushButton("Mitarbeiter komplett erledigt")
+        btn_alle_erledigt.setStyleSheet(button_primary())
+        btn_alle_erledigt.clicked.connect(lambda: self._markieren(STATUS_ERLEDIGT, nur_auswahl=False))
+        aktion_zeile.addWidget(btn_alle_erledigt)
+        aktion_zeile.addStretch()
+        rechts_layout.addLayout(aktion_zeile)
+
+        splitter.addWidget(rechts)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+
+    # ------------------------------------------------------------------
+    def _monate_laden(self):
+        self._monat_combo.blockSignals(True)
+        self._monat_combo.clear()
+        monate = get_verfuegbare_monate()
+        for jahr, monat in monate:
+            self._monat_combo.addItem(f"{MONATSNAMEN[monat - 1]} {jahr}", (jahr, monat))
+        self._monat_combo.blockSignals(False)
+
+    def _monat_gewechselt(self):
+        self._daten_laden()
+
+    def aktualisieren(self):
+        """Neu berechnen, z. B. nach einem Import."""
+        aktuelle_auswahl = self._monat_combo.currentData()
+        self._monate_laden()
+        if aktuelle_auswahl:
+            idx = self._monat_combo.findData(aktuelle_auswahl)
+            if idx >= 0:
+                self._monat_combo.setCurrentIndex(idx)
+        self._daten_laden()
+
+    # ------------------------------------------------------------------
+    def _daten_laden(self):
+        auswahl = self._monat_combo.currentData()
+        if not auswahl:
+            self._ergebnis = None
+            self._mitarbeiter_liste.clear()
+            self._tabelle.setRowCount(0)
+            self._mitarbeiter_titel.setText("Kein Monat mit Ursprungsplanung UND Tagesdienstplänen vorhanden.")
+            self._status_label.setText("")
+            return
+
+        jahr, monat = auswahl
+        self._ergebnis = berechne_abgleich(jahr, monat)
+
+        self._mitarbeiter_liste.blockSignals(True)
+        self._mitarbeiter_liste.clear()
+        for ma in self._ergebnis.mitarbeiter:
+            self._mitarbeiter_liste.addItem(self._mitarbeiter_eintrag(ma))
+        self._mitarbeiter_liste.blockSignals(False)
+
+        gesamt_offen = sum(ma.anzahl_offen for ma in self._ergebnis.mitarbeiter)
+        self._status_label.setText(
+            f"{len(self._ergebnis.mitarbeiter)} Mitarbeiter mit Abweichungen, {gesamt_offen} offen"
+        )
+
+        letzte_id = get_letzte_position(jahr, monat)
+        ziel_index = 0
+        if letzte_id is not None:
+            for i, ma in enumerate(self._ergebnis.mitarbeiter):
+                if ma.mitarbeiter_id == letzte_id:
+                    ziel_index = i
+                    break
+        if self._mitarbeiter_liste.count():
+            self._mitarbeiter_liste.setCurrentRow(ziel_index)
+        else:
+            self._mitarbeiter_titel.setText("Keine Abweichungen gefunden – Ursprungsplanung und "
+                                             "Tagesdienstpläne stimmen für diesen Monat überein.")
+            self._warnung_label.setVisible(False)
+            self._tabelle.setRowCount(0)
+
+    def _mitarbeiter_eintrag(self, ma) -> QListWidgetItem:
+        praefix = "⚠ " if ma.kein_gegenstueck else ""
+        text = f"{praefix}{ma.name}  ({ma.anzahl_offen}/{ma.anzahl_gesamt} offen)"
+        item = QListWidgetItem(text)
+        item.setData(Qt.ItemDataRole.UserRole, ma.mitarbeiter_id)
+        if ma.anzahl_offen == 0:
+            item.setForeground(QColor(FIORI_SUCCESS))
+        elif ma.kein_gegenstueck:
+            item.setForeground(QColor(FIORI_ERROR))
+        return item
+
+    # ------------------------------------------------------------------
+    def _mitarbeiter_gewaehlt(self, aktuell: QListWidgetItem, _vorher: QListWidgetItem):
+        if not aktuell or not self._ergebnis:
+            return
+        mid = aktuell.data(Qt.ItemDataRole.UserRole)
+        self._aktueller_mitarbeiter_id = mid
+        ma = next((m for m in self._ergebnis.mitarbeiter if m.mitarbeiter_id == mid), None)
+        if not ma:
+            return
+
+        self._mitarbeiter_titel.setText(ma.name)
+        if ma.nur_ursprungsplanung:
+            self._warnung_label.setText(
+                "⚠ Für diesen Mitarbeiter liegen in diesem Monat nur Ursprungsplanung-Daten vor – "
+                "in den Tagesdienstplänen wurde kein Eintrag gefunden. Möglicherweise stimmt der "
+                "Name zwischen beiden Quellen nicht überein."
+            )
+            self._warnung_label.setVisible(True)
+        elif ma.nur_staerkemeldung:
+            self._warnung_label.setText(
+                "⚠ Für diesen Mitarbeiter liegen in diesem Monat nur Tagesdienstplan-Daten vor – "
+                "in der Ursprungsplanung wurde kein Eintrag gefunden. Möglicherweise stimmt der "
+                "Name zwischen beiden Quellen nicht überein."
+            )
+            self._warnung_label.setVisible(True)
+        else:
+            self._warnung_label.setVisible(False)
+
+        self._tabelle_befuellen(ma)
+
+        if self._ergebnis:
+            set_letzte_position(self._ergebnis.jahr, self._ergebnis.monat, mid)
+
+    def _tabelle_befuellen(self, ma):
+        self._tabelle.blockSignals(True)
+        self._tabelle.setRowCount(len(ma.eintraege))
+        for zeile, eintrag in enumerate(ma.eintraege):
+            wochentag = WOCHENTAGE_KURZ[date.fromisoformat(eintrag.datum).weekday()]
+            alt = f"{eintrag.alt_start} – {eintrag.alt_end}" if eintrag.alt_start else "–"
+            neu = f"{eintrag.neu_start} – {eintrag.neu_end}" if eintrag.neu_start else "–"
+
+            werte = [eintrag.datum, wochentag, ART_LABEL[eintrag.art], alt, neu]
+            for spalte, wert in enumerate(werte):
+                item = QTableWidgetItem(wert)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                farbe = ART_FARBE[eintrag.art]
+                item.setBackground(_hex_zu_rgba(farbe, 30))
+                self._tabelle.setItem(zeile, spalte, item)
+
+            status_item = QTableWidgetItem()
+            status_item.setFlags(
+                (item.flags() | Qt.ItemFlag.ItemIsUserCheckable) & ~Qt.ItemFlag.ItemIsEditable
+            )
+            status_item.setCheckState(
+                Qt.CheckState.Checked if eintrag.status == STATUS_ERLEDIGT else Qt.CheckState.Unchecked
+            )
+            status_item.setData(Qt.ItemDataRole.UserRole, (eintrag.datum, eintrag.art))
+            self._tabelle.setItem(zeile, 5, status_item)
+
+        self._tabelle.resizeColumnsToContents()
+        self._tabelle.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    def _status_geaendert(self, item: QTableWidgetItem):
+        if item.column() != 5 or self._aktueller_mitarbeiter_id is None:
+            return
+        datum, art = item.data(Qt.ItemDataRole.UserRole)
+        status = STATUS_ERLEDIGT if item.checkState() == Qt.CheckState.Checked else STATUS_OFFEN
+        set_eintrag_status(self._aktueller_mitarbeiter_id, datum, art, status)
+        self._eintrag_status_aktualisieren(datum, art, status)
+        self._mitarbeiter_liste_aktualisieren()
+
+    def _eintrag_status_aktualisieren(self, datum: str, art: str, status: str):
+        if not self._ergebnis or self._aktueller_mitarbeiter_id is None:
+            return
+        ma = next((m for m in self._ergebnis.mitarbeiter if m.mitarbeiter_id == self._aktueller_mitarbeiter_id), None)
+        if not ma:
+            return
+        for e in ma.eintraege:
+            if e.datum == datum and e.art == art:
+                e.status = status
+
+    def _mitarbeiter_liste_aktualisieren(self):
+        aktuelle_zeile = self._mitarbeiter_liste.currentRow()
+        self._mitarbeiter_liste.blockSignals(True)
+        for i, ma in enumerate(self._ergebnis.mitarbeiter):
+            self._mitarbeiter_liste.takeItem(i)
+            self._mitarbeiter_liste.insertItem(i, self._mitarbeiter_eintrag(ma))
+        self._mitarbeiter_liste.setCurrentRow(aktuelle_zeile)
+        self._mitarbeiter_liste.blockSignals(False)
+        gesamt_offen = sum(ma.anzahl_offen for ma in self._ergebnis.mitarbeiter)
+        self._status_label.setText(
+            f"{len(self._ergebnis.mitarbeiter)} Mitarbeiter mit Abweichungen, {gesamt_offen} offen"
+        )
+
+    # ------------------------------------------------------------------
+    def _markieren(self, status: str, nur_auswahl: bool):
+        if not self._ergebnis or self._aktueller_mitarbeiter_id is None:
+            return
+        ma = next((m for m in self._ergebnis.mitarbeiter if m.mitarbeiter_id == self._aktueller_mitarbeiter_id), None)
+        if not ma:
+            return
+
+        if nur_auswahl:
+            zeilen = sorted({i.row() for i in self._tabelle.selectedIndexes()})
+            eintraege = [ma.eintraege[z] for z in zeilen]
+        else:
+            eintraege = ma.eintraege
+
+        if not eintraege:
+            return
+        set_status_fuer_mitarbeiter(ma.mitarbeiter_id, eintraege, status)
+        for e in eintraege:
+            e.status = status
+        self._tabelle_befuellen(ma)
+        self._mitarbeiter_liste_aktualisieren()
+
+    def _naechster_offener(self):
+        if not self._ergebnis or not self._ergebnis.mitarbeiter:
+            return
+        anzahl = len(self._ergebnis.mitarbeiter)
+        start = self._mitarbeiter_liste.currentRow()
+        for schritt in range(1, anzahl + 1):
+            index = (start + schritt) % anzahl
+            if self._ergebnis.mitarbeiter[index].anzahl_offen > 0:
+                self._mitarbeiter_liste.setCurrentRow(index)
+                return
