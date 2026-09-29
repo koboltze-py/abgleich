@@ -83,6 +83,34 @@ def get_quellen() -> list[str]:
         con.close()
 
 
+def get_dokumente(quelle: str | None = None, jahr: int | None = None, monat: int | None = None) -> list[dict]:
+    """Liste importierter Dokumente (dateipfad, dateiname, von_datum, bis_datum),
+    optional auf eine Quelle und/oder einen Monat eingeschränkt, neuestes zuerst."""
+    bedingungen = []
+    parameter: list = []
+    if quelle:
+        bedingungen.append("quelle = ?")
+        parameter.append(quelle)
+    if jahr and monat:
+        von = f"{jahr:04d}-{monat:02d}-01"
+        bis_monat, bis_jahr = (monat + 1, jahr) if monat < 12 else (1, jahr + 1)
+        bis = f"{bis_jahr:04d}-{bis_monat:02d}-01"
+        bedingungen.append("von_datum < ? AND (bis_datum IS NULL OR bis_datum >= ?)")
+        parameter.extend([bis, von])
+    bedingung = f"WHERE {' AND '.join(bedingungen)}" if bedingungen else ""
+
+    con = get_connection()
+    try:
+        rows = con.execute(
+            f"SELECT dateipfad, dateiname, quelle, von_datum, bis_datum FROM dokumente "
+            f"{bedingung} ORDER BY von_datum DESC, dateiname",
+            parameter,
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        con.close()
+
+
 def get_dashboard_stats() -> dict:
     con = get_connection()
     try:

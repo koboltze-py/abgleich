@@ -3,17 +3,18 @@ Abgleich-Workflow: vergleicht Ursprungsplanung und Tagesdienstpläne je
 Mitarbeiter und ermöglicht das geordnete Abarbeiten der gefundenen
 Abweichungen (neue Dienste, geänderte Zeiten, entfallene Dienste).
 """
+import os
 from datetime import date
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem, QFrame,
-    QAbstractItemView, QSplitter,
+    QAbstractItemView, QSplitter, QMessageBox,
 )
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QColor, QDesktopServices
 
-from config import FIORI_TEXT, FIORI_SUCCESS, FIORI_WARNING, FIORI_ERROR, FIORI_BORDER
+from config import FIORI_TEXT, FIORI_SUCCESS, FIORI_WARNING, FIORI_ERROR, FIORI_BORDER, QUELLE_STAERKEMELDUNG
 from gui.styles import table_style, button_primary, button_secondary, card_style
 from gui.monatsuebersicht import MONATSNAMEN, WOCHENTAGE_KURZ
 from functions.abgleich_service import (
@@ -21,6 +22,7 @@ from functions.abgleich_service import (
     get_letzte_position, set_letzte_position, get_verfuegbare_monate,
     ART_HINZUGEFUEGT, ART_ZEIT_GEAENDERT, ART_ENTFALLEN, STATUS_OFFEN, STATUS_ERLEDIGT,
 )
+from functions.dienste_service import get_dokumente
 
 ART_LABEL = {
     ART_HINZUGEFUEGT: "Hinzugekommen",
@@ -72,6 +74,17 @@ class AbgleichWidget(QWidget):
         self._monat_combo = QComboBox()
         self._monat_combo.currentIndexChanged.connect(self._monat_gewechselt)
         filter_zeile.addWidget(self._monat_combo)
+
+        filter_zeile.addSpacing(20)
+        filter_zeile.addWidget(QLabel("Word-Dokument:"))
+        self._dokument_combo = QComboBox()
+        self._dokument_combo.setMinimumWidth(260)
+        filter_zeile.addWidget(self._dokument_combo)
+        btn_dokument_oeffnen = QPushButton("Öffnen")
+        btn_dokument_oeffnen.setStyleSheet(button_secondary())
+        btn_dokument_oeffnen.clicked.connect(self._dokument_oeffnen)
+        filter_zeile.addWidget(btn_dokument_oeffnen)
+
         filter_zeile.addStretch()
         self._status_label = QLabel("")
         self._status_label.setStyleSheet(f"color: {FIORI_TEXT};")
@@ -175,12 +188,14 @@ class AbgleichWidget(QWidget):
             self._ergebnis = None
             self._mitarbeiter_liste.clear()
             self._tabelle.setRowCount(0)
+            self._dokument_combo.clear()
             self._mitarbeiter_titel.setText("Kein Monat mit Ursprungsplanung UND Tagesdienstplänen vorhanden.")
             self._status_label.setText("")
             return
 
         jahr, monat = auswahl
         self._ergebnis = berechne_abgleich(jahr, monat)
+        self._dokumente_laden(jahr, monat)
 
         self._mitarbeiter_liste.blockSignals(True)
         self._mitarbeiter_liste.clear()
@@ -346,3 +361,23 @@ class AbgleichWidget(QWidget):
             if self._ergebnis.mitarbeiter[index].anzahl_offen > 0:
                 self._mitarbeiter_liste.setCurrentRow(index)
                 return
+
+    # ------------------------------------------------------------------
+    def _dokumente_laden(self, jahr: int, monat: int):
+        """Füllt das Dropdown mit den für den Monat importierten Word-Dokumenten."""
+        self._dokument_combo.clear()
+        dokumente = get_dokumente(quelle=QUELLE_STAERKEMELDUNG, jahr=jahr, monat=monat)
+        if not dokumente:
+            self._dokument_combo.addItem("Keine Word-Dokumente für diesen Monat", None)
+            return
+        for dok in dokumente:
+            self._dokument_combo.addItem(dok["dateiname"], dok["dateipfad"])
+
+    def _dokument_oeffnen(self):
+        pfad = self._dokument_combo.currentData()
+        if not pfad:
+            return
+        if not os.path.isfile(pfad):
+            QMessageBox.warning(self, "Datei nicht gefunden", f"Die Datei wurde nicht gefunden:\n{pfad}")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(pfad))
