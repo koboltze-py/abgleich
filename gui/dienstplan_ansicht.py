@@ -9,7 +9,7 @@ import os
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTreeView,
     QSplitter, QFileSystemModel, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QMessageBox, QFileDialog,
+    QAbstractItemView, QMessageBox, QFileDialog, QLineEdit,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QColor
@@ -48,6 +48,7 @@ class DienstplanAnsichtWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._fs_model: QFileSystemModel | None = None
+        self._zeilen_namen: list[str | None] = []  # None = Abschnitts-Kopfzeile, sonst Personenname
         self._aufbauen()
         self._baum_aufbauen()
 
@@ -112,6 +113,11 @@ class DienstplanAnsichtWidget(QWidget):
         self._status_label.setWordWrap(True)
         self._status_label.setStyleSheet("color: #888; border: none;")
         vorschau_layout.addWidget(self._status_label)
+
+        self._suche_feld = QLineEdit()
+        self._suche_feld.setPlaceholderText("Name suchen…")
+        self._suche_feld.textChanged.connect(self._suche_geaendert)
+        vorschau_layout.addWidget(self._suche_feld)
 
         self._tabelle = QTableWidget(0, 5)
         self._tabelle.setHorizontalHeaderLabels(["Kategorie", "Name", "Dienst", "Von", "Bis"])
@@ -193,6 +199,7 @@ class DienstplanAnsichtWidget(QWidget):
         self._tabelle_befuellen(ergebnis)
         self._status_label.setText(f"Geladen: {os.path.basename(pfad)}")
         self._status_label.setStyleSheet("color: #107e3e; border: none;")
+        self._suche_feld.clear()
 
     # ------------------------------------------------------------------
     def _tabelle_befuellen(self, daten: dict):
@@ -245,6 +252,7 @@ class DienstplanAnsichtWidget(QWidget):
         total_rows = sum(1 + len(personen) for _, _, _, personen in abschnitte)
         self._tabelle.clearSpans()
         self._tabelle.setRowCount(total_rows)
+        self._zeilen_namen = [None] * total_rows
 
         row = 0
         sep_font = QFont("Arial", 10, QFont.Weight.Bold)
@@ -274,6 +282,27 @@ class DienstplanAnsichtWidget(QWidget):
                 if p.get("ist_bulmorfahrer"):
                     for col in range(5):
                         self._tabelle.item(row, col).setBackground(QColor("#fff3b0"))
+                self._zeilen_namen[row] = p.get("anzeigename", "")
                 row += 1
 
         self._tabelle.resizeColumnsToContents()
+        self._suche_geaendert(self._suche_feld.text())
+
+    def _suche_geaendert(self, text: str):
+        """Blendet Personen-Zeilen aus, deren Name nicht zum Suchtext passt;
+        ein Abschnitt wird komplett ausgeblendet, wenn keine seiner Zeilen passt."""
+        text = text.strip().lower()
+        abschnitt_start = 0
+        abschnitt_sichtbar = True
+        for row, name in enumerate(self._zeilen_namen):
+            if name is None:
+                self._tabelle.setRowHidden(abschnitt_start, not abschnitt_sichtbar)
+                abschnitt_start = row
+                abschnitt_sichtbar = False
+            else:
+                sichtbar = not text or text in name.lower()
+                self._tabelle.setRowHidden(row, not sichtbar)
+                abschnitt_sichtbar = abschnitt_sichtbar or sichtbar
+        if self._zeilen_namen:
+            self._tabelle.setRowHidden(abschnitt_start, not abschnitt_sichtbar)
+

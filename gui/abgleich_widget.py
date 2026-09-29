@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem, QFrame,
     QAbstractItemView, QSplitter, QMessageBox, QInputDialog, QTabWidget,
-    QFileDialog,
+    QFileDialog, QLineEdit,
 )
 from PySide6.QtCore import Qt, QUrl, QMarginsF
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QTextDocument, QPageSize
@@ -138,6 +138,10 @@ class AbgleichWidget(QWidget):
         links_kopf = QLabel("Mitarbeiter mit Abweichungen")
         links_kopf.setStyleSheet(f"font-weight: bold; color: {FIORI_TEXT}; border: none;")
         links_layout.addWidget(links_kopf)
+        self._mitarbeiter_suche = QLineEdit()
+        self._mitarbeiter_suche.setPlaceholderText("Name suchen…")
+        self._mitarbeiter_suche.textChanged.connect(self._mitarbeiter_liste_filtern)
+        links_layout.addWidget(self._mitarbeiter_suche)
         self._mitarbeiter_liste = QListWidget()
         self._mitarbeiter_liste.setStyleSheet(f"border: 1px solid {FIORI_BORDER}; border-radius: 4px;")
         self._mitarbeiter_liste.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -324,6 +328,7 @@ class AbgleichWidget(QWidget):
         for ma in self._ergebnis.mitarbeiter:
             self._mitarbeiter_liste.addItem(self._mitarbeiter_eintrag(ma))
         self._mitarbeiter_liste.blockSignals(False)
+        self._mitarbeiter_liste_filtern(self._mitarbeiter_suche.text())
 
         gesamt_offen = sum(ma.anzahl_offen for ma in self._ergebnis.mitarbeiter)
         self._status_label.setText(
@@ -480,6 +485,7 @@ class AbgleichWidget(QWidget):
             self._mitarbeiter_liste.insertItem(i, self._mitarbeiter_eintrag(ma))
         self._mitarbeiter_liste.setCurrentRow(aktuelle_zeile)
         self._mitarbeiter_liste.blockSignals(False)
+        self._mitarbeiter_liste_filtern(self._mitarbeiter_suche.text())
         gesamt_offen = sum(ma.anzahl_offen for ma in self._ergebnis.mitarbeiter)
         self._status_label.setText(
             f"{len(self._ergebnis.mitarbeiter)} Mitarbeiter mit Abweichungen, {gesamt_offen} offen"
@@ -524,6 +530,12 @@ class AbgleichWidget(QWidget):
             if self._ergebnis.mitarbeiter[index].anzahl_offen > 0:
                 self._mitarbeiter_liste.setCurrentRow(index)
                 return
+
+    def _mitarbeiter_liste_filtern(self, text: str):
+        text = text.strip().lower()
+        for i in range(self._mitarbeiter_liste.count()):
+            item = self._mitarbeiter_liste.item(i)
+            item.setHidden(bool(text) and text not in item.text().lower())
 
     # ------------------------------------------------------------------
     def _ausgewaehlte_mitarbeiter(self) -> list:
