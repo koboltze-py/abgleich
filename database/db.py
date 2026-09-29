@@ -74,6 +74,15 @@ CREATE TABLE IF NOT EXISTS abgleich_manuelle_zuordnung (
     erstellt_am      TEXT NOT NULL,
     PRIMARY KEY (mitarbeiter_id_a, mitarbeiter_id_b)
 );
+
+-- Gegenstück: erzwingt, dass zwei Schreibweisen NIE als dieselbe Person
+-- gelten, auch wenn die automatische Erkennung sie fälschlich verbinden würde.
+CREATE TABLE IF NOT EXISTS abgleich_manuelle_trennung (
+    mitarbeiter_id_a INTEGER NOT NULL REFERENCES mitarbeiter(id) ON DELETE CASCADE,
+    mitarbeiter_id_b INTEGER NOT NULL REFERENCES mitarbeiter(id) ON DELETE CASCADE,
+    erstellt_am      TEXT NOT NULL,
+    PRIMARY KEY (mitarbeiter_id_a, mitarbeiter_id_b)
+);
 """
 
 # Spalten, die nachträglich zu bestehenden Datenbanken hinzugefügt wurden

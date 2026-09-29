@@ -111,7 +111,7 @@ def _namens_vollstaendigkeit(name: str) -> int:
     return 0
 
 
-def _namen_gruppieren(namen: list[str]) -> dict[str, int]:
+def _namen_gruppieren(namen: list[str], getrennt: set[frozenset] | None = None) -> dict[str, int]:
     """Führt unterschiedlich geschriebene Namen zusammen, die vermutlich
     dieselbe Person meinen - aber nur, wenn die Zuordnung eindeutig ist.
 
@@ -123,13 +123,19 @@ def _namen_gruppieren(namen: list[str]) -> dict[str, int]:
     mehrere unterschiedliche Personen passen könnte) zwei eigentlich getrennte
     Personen. Ein solcher Knoten (der mit den meisten anderen in der Gruppe
     kompatibel ist) wird isoliert und bleibt als eigener, zu prüfender
-    Mismatch stehen; der Rest wird rekursiv neu aufgeteilt."""
+    Mismatch stehen; der Rest wird rekursiv neu aufgeteilt.
+
+    `getrennt` sind vom Nutzer erzwungene Namenspaare, die NIE als dieselbe
+    Person gelten sollen, selbst wenn sie sonst kompatibel wären."""
     eindeutige_namen = list(dict.fromkeys(namen))
     komponenten = {n: _komponenten(n) for n in eindeutige_namen}
+    getrennt = getrennt or set()
 
     kompatibel: dict[str, set[str]] = {n: set() for n in eindeutige_namen}
     for i, a in enumerate(eindeutige_namen):
         for b in eindeutige_namen[i + 1:]:
+            if frozenset((a, b)) in getrennt:
+                continue
             if _namen_gleiche_person(komponenten[a], komponenten[b]):
                 kompatibel[a].add(b)
                 kompatibel[b].add(a)
@@ -200,6 +206,7 @@ class MitarbeiterAbgleich:
     eintraege: list[AbgleichEintrag] = field(default_factory=list)
     varianten: list[str] = field(default_factory=list)  # alle zusammengeführten Rohnamen
     mitarbeiter_ids: list[int] = field(default_factory=list)  # alle zusammengeführten mitarbeiter_id
+    mitglieder: list[tuple[str, int]] = field(default_factory=list)  # (Rohname, mitarbeiter_id) je Variante
     nur_ursprungsplanung: bool = False  # keine Stärkemeldung-Daten im ganzen Monat gefunden
     nur_staerkemeldung: bool = False    # keine Ursprungsplanung-Daten im ganzen Monat gefunden
 
@@ -259,13 +266,24 @@ def berechne_abgleich(jahr: int, monat: int) -> AbgleichErgebnis:
         manuelle_paare = con.execute(
             "SELECT mitarbeiter_id_a, mitarbeiter_id_b FROM abgleich_manuelle_zuordnung"
         ).fetchall()
+        trennungs_paare = con.execute(
+            "SELECT mitarbeiter_id_a, mitarbeiter_id_b FROM abgleich_manuelle_trennung"
+        ).fetchall()
     finally:
         con.close()
+
+    id_zu_name: dict[int, str] = {r["mitarbeiter_id"]: r["mitarbeiter"] for r in rows}
+    getrennt: set[frozenset] = set()
+    for paar in trennungs_paare:
+        na = id_zu_name.get(paar["mitarbeiter_id_a"])
+        nb = id_zu_name.get(paar["mitarbeiter_id_b"])
+        if na and nb:
+            getrennt.add(frozenset((na, nb)))
 
     # Rohnamen zu Gruppen (vermutlich dieselbe Person) zusammenführen,
     # unabhängig davon, unter welcher mitarbeiter_id/Schreibweise sie in den
     # beiden Quellen jeweils gespeichert sind.
-    gruppe_je_name = _namen_gruppieren([r["mitarbeiter"] for r in rows])
+    gruppe_je_name = _namen_gruppieren([r["mitarbeiter"] for r in rows], getrennt=getrennt)
 
     # Manuelle Zuordnungen (vom Nutzer bestätigte Verknüpfungen, die die
     # automatische Erkennung nicht selbst gefunden hat) über die automatischen
@@ -367,6 +385,10 @@ def berechne_abgleich(jahr: int, monat: int) -> AbgleichErgebnis:
             mitarbeiter_id=canonical_id, name=anzeige_name, eintraege=eintraege,
             varianten=sorted(gruppen_namen[gruppe], key=str.lower),
             mitarbeiter_ids=sorted(alle_ids),
+            mitglieder=sorted(
+                ((id_zu_name[mid], mid) for mid in alle_ids if mid in id_zu_name),
+                key=lambda paar: paar[0].lower(),
+            ),
             nur_ursprungsplanung=gruppe in up_gruppen and gruppe not in sm_gruppen,
             nur_staerkemeldung=gruppe in sm_gruppen and gruppe not in up_gruppen,
         ))
@@ -478,6 +500,54 @@ def manuelle_zuordnung_aufheben(mitarbeiter_id_a: int, mitarbeiter_id_b: int) ->
     try:
         con.execute(
             "DELETE FROM abgleich_manuelle_zuordnung WHERE mitarbeiter_id_a = ? AND mitarbeiter_id_b = ?",
+            (a, b),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_manuelle_trennungen() -> list[tuple[int, int]]:
+    """Alle vom Nutzer erzwungenen Trennungen (Namen, die NIE zusammengeführt werden sollen)."""
+    con = get_connection()
+    try:
+        rows = con.execute(
+            "SELECT mitarbeiter_id_a, mitarbeiter_id_b FROM abgleich_manuelle_trennung"
+        ).fetchall()
+        return [(r["mitarbeiter_id_a"], r["mitarbeiter_id_b"]) for r in rows]
+    finally:
+        con.close()
+
+
+def manuell_trennen(mitarbeiter_id_a: int, mitarbeiter_id_b: int) -> None:
+    """Erzwingt, dass zwei Mitarbeiter-Identitäten NIE als dieselbe Person gelten
+    - hebt bei Bedarf eine bestehende manuelle Zuordnung zwischen ihnen auf und
+    trennt sie auch, falls die automatische Erkennung sie sonst zusammenführen würde."""
+    if mitarbeiter_id_a == mitarbeiter_id_b:
+        return
+    a, b = sorted((mitarbeiter_id_a, mitarbeiter_id_b))
+    con = get_connection()
+    try:
+        con.execute(
+            "DELETE FROM abgleich_manuelle_zuordnung WHERE mitarbeiter_id_a = ? AND mitarbeiter_id_b = ?",
+            (a, b),
+        )
+        con.execute(
+            "INSERT OR IGNORE INTO abgleich_manuelle_trennung (mitarbeiter_id_a, mitarbeiter_id_b, erstellt_am) "
+            "VALUES (?, ?, ?)",
+            (a, b, jetzt()),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def manuelle_trennung_aufheben(mitarbeiter_id_a: int, mitarbeiter_id_b: int) -> None:
+    a, b = sorted((mitarbeiter_id_a, mitarbeiter_id_b))
+    con = get_connection()
+    try:
+        con.execute(
+            "DELETE FROM abgleich_manuelle_trennung WHERE mitarbeiter_id_a = ? AND mitarbeiter_id_b = ?",
             (a, b),
         )
         con.commit()

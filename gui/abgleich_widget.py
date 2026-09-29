@@ -9,7 +9,7 @@ from datetime import date
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem, QFrame,
-    QAbstractItemView, QSplitter, QMessageBox,
+    QAbstractItemView, QSplitter, QMessageBox, QInputDialog,
 )
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
@@ -21,6 +21,7 @@ from functions.abgleich_service import (
     berechne_abgleich, set_eintrag_status, set_status_fuer_mitarbeiter,
     get_letzte_position, set_letzte_position, get_verfuegbare_monate,
     get_manuelle_zuordnungen, manuell_zusammenfuehren, manuelle_zuordnung_aufheben,
+    manuell_trennen,
     ART_HINZUGEFUEGT, ART_ZEIT_GEAENDERT, ART_ENTFALLEN, STATUS_OFFEN, STATUS_ERLEDIGT,
 )
 from functions.dienste_service import get_dokumente
@@ -120,11 +121,18 @@ class AbgleichWidget(QWidget):
         btn_manuell_mergen.setStyleSheet(button_secondary())
         btn_manuell_mergen.clicked.connect(self._manuell_zusammenfuehren)
         merge_zeile.addWidget(btn_manuell_mergen)
-        btn_manuell_trennen = QPushButton("Verknüpfung aufheben")
+        btn_manuell_trennen = QPushButton("Manuelle Verknüpfung aufheben")
         btn_manuell_trennen.setStyleSheet(button_secondary())
         btn_manuell_trennen.clicked.connect(self._manuelle_verknuepfung_aufheben)
         merge_zeile.addWidget(btn_manuell_trennen)
         links_layout.addLayout(merge_zeile)
+
+        trenn_zeile = QHBoxLayout()
+        btn_namen_trennen = QPushButton("Namen aus Zusammenführung trennen…")
+        btn_namen_trennen.setStyleSheet(button_secondary())
+        btn_namen_trennen.clicked.connect(self._namen_trennen)
+        trenn_zeile.addWidget(btn_namen_trennen)
+        links_layout.addLayout(trenn_zeile)
         splitter.addWidget(links)
 
         # --- rechte Seite: Änderungen des gewählten Mitarbeiters ---
@@ -429,6 +437,31 @@ class AbgleichWidget(QWidget):
             return
         for a, b in betroffen:
             manuelle_zuordnung_aufheben(a, b)
+        self.aktualisieren()
+
+    def _namen_trennen(self):
+        if not self._ergebnis or self._aktueller_mitarbeiter_id is None:
+            return
+        ma = next((m for m in self._ergebnis.mitarbeiter if m.mitarbeiter_id == self._aktueller_mitarbeiter_id), None)
+        if not ma or len(ma.mitglieder) < 2:
+            QMessageBox.information(
+                self, "Namen trennen",
+                "Dieser Mitarbeiter besteht nur aus einem Namen - es gibt nichts zu trennen."
+            )
+            return
+        namen = [name for name, _mid in ma.mitglieder]
+        auswahl, ok = QInputDialog.getItem(
+            self, "Namen trennen",
+            "Welcher Name gehört NICHT zu den anderen und soll wieder als eigener "
+            "Mitarbeiter behandelt werden?",
+            namen, 0, False,
+        )
+        if not ok or not auswahl:
+            return
+        heraustrennen_id = next(mid for name, mid in ma.mitglieder if name == auswahl)
+        for name, mid in ma.mitglieder:
+            if mid != heraustrennen_id:
+                manuell_trennen(heraustrennen_id, mid)
         self.aktualisieren()
 
     # ------------------------------------------------------------------
